@@ -1,0 +1,14 @@
+[project]
+name = "backend"
+version = "0.1.0"
+description = "智能旅行助手后端"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi[standard]>=0.142.2",
+    "langchain>=1.4.3",
+    "langchain-mcp-adapters>=0.3.2",
+    "langchain-openai>=1.6.7",
+    "langgraph>=1.2.14",
+    "pydantic-settings>=2.15.0",
+]

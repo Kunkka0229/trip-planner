@@ -1,0 +1,14 @@
+# 密钥
+.env
+.env.local
+
+# 依赖与构建产物
+node_modules/
+.venv/
+dist/
+__pycache__/
+*.pyc
+
+# 系统/编辑器
+.DS_Store
+.idea/

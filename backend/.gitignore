@@ -1,0 +1,9 @@
+# 真实配置，含密钥，绝对不能提交
+.env
+
+# 虚拟环境，相当于 node_modules
+.venv/
+
+# Python 运行时生成的字节码缓存
+__pycache__/
+*.pyc
