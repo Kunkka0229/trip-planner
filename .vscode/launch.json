@@ -1,0 +1,19 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // 调试后端：相当于在 backend 目录下执行 python -m uvicorn app.api.main:app
+      // 不加 --reload：reload 会在子进程里跑代码，断点停不下来
+      "name": "后端：FastAPI（调试）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["app.api.main:app", "--host", "0.0.0.0", "--port", "7001"],
+      "cwd": "${workspaceFolder}/backend",
+      "python": "${workspaceFolder}/backend/.venv/bin/python",
+      // 改成 false：断点也能停进 langgraph、fastapi 等第三方库内部，看框架怎么调用你的节点
+      "justMyCode": true,
+      "console": "integratedTerminal"
+    }
+  ]
+}

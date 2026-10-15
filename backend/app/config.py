@@ -63,7 +63,7 @@ class Settings(BaseSettings):
     #   direct      = 代码直连高德 + 单 Agent 规划（第 6、7 课）
     #   multi_agent = 书中的多 Agent + MCP，LangGraph 编排（第 8 课）
     # Literal：只允许这三个值，.env 里写错（比如 contxt）启动时就会直接报错
-    planner_mode: Literal["context", "direct", "multi_agent"] = "context"
+    planner_mode: Literal["graph", "context", "direct", "multi_agent"] = "graph"
 
     amap_qps_limit: float = 3  # 高德每秒最多请求几次，个人开发者 Key 的并发上限比较低；0 = 不限速
     

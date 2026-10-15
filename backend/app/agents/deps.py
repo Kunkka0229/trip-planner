@@ -33,5 +33,9 @@ def get_trip_planner() -> Planner | None:
         from app.agents.multi_agent_planner import MultiAgentTripPlanner
         return MultiAgentTripPlanner(llm=llm)
     
+    if mode == "graph":
+        from app.agents.graph_planner import GraphTripPlanner
+        return GraphTripPlanner(amap=get_amap_client(), llm=llm)
+    
     from app.agents.trip_planner import TripPlanner
     return TripPlanner(amap=get_amap_client(), llm=llm)
