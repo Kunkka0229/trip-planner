@@ -2,11 +2,9 @@
 
 > **需求卡片**
 > 产品后面要加"多轮修改行程""超预算时先问用户""刷新页面后继续"。现在的规划流程是一串 Python 函数调用，重试循环写在 `for` 里，这些能力都加不进去。
-> 本迭代：**把主流程迁移到 LangGraph，对外接口行为保持不变**（基础课第 11 课的测试必须全部通过）。
+> 本迭代：**把主流程迁移到 LangGraph，对外接口行为保持不变**。
 
 **目标**：把第 7 课的"生成 → 校验 → 重试 → 兜底"和第 9 课的"并行收集上下文"，改写成一张 LangGraph 状态图。学完你会真正理解 State、Reducer、条件边、子图、运行时依赖注入这 5 个概念，它们是后面 12 节课的地基。
-
-> 本课代码在临时目录里用基础课第 11 课的假高德、假大模型测试过：原有 24 个测试 + 本课新增 7 个，共 31 个全部通过。另外用"每次请求固定耗时 0.5 秒"的假高德验证了 4 个工具节点确实并行执行（总耗时 0.52 秒，串行需要 2 秒以上）。
 
 ## 为什么要换成图？
 
@@ -96,16 +94,11 @@ app/
 │   └── deps.py             ← 修改：增加 graph 模式
 ├── planner/context.py      ← 修改：工具方法改成公开的，抽出 assemble_context
 └── config.py               ← 修改：planner_mode 增加 "graph"，并设为默认
-tests/
-└── test_graph.py           ← 新增
 ```
-
-> 如果你基础课第 11 课的 `tests/` 还没建，先按第 11 课 Part 1 的 Step 1 ~ Step 4 把测试补上：**重构之前先有测试**，这是公司里做重构的基本纪律。测试是你判断"行为没变"的唯一依据。
 
 ```bash
 cd backend
 mkdir -p app/graph && touch app/graph/__init__.py
-uv run pytest -q   # 先确认重构之前测试全部通过
 ```
 
 ## Step 1：小重构 `app/planner/context.py`
@@ -162,7 +155,7 @@ def assemble_context(request: TripRequest, snapshot: dict[str, Any], tool_status
     }
 ```
 
-改完立刻跑一次 `uv run pytest -q`，应该还是全部通过。**重构的节奏：每次只动一小步，动完马上跑测试。**
+改完启动一次后端、生成一次行程，确认和改之前一样。**重构的节奏：每次只动一小步，动完马上验证。**
 
 ## Step 2：State 和依赖 `app/graph/state.py`
 
@@ -317,7 +310,7 @@ def build_collect_graph():
 **要点**
 
 1. **fan-out / fan-in**：`START` 连出 4 条边，LangGraph 会在**同一步（superstep）**里并行执行这 4 个节点（同步调用时用线程池，异步调用时用 `asyncio.gather`）。`add_edge([...], "assemble")` 表示"等 4 个都结束了才往下走"。效果和第 9 课的 `ThreadPoolExecutor` 一样，但你不用自己管线程了。
-2. **为什么必须有 reducer**：4 个并行节点在同一步里都更新了 `snapshot`。没有 reducer 时 LangGraph 会抛出 `InvalidUpdateError`，因为它不知道该保留谁的。有了 `merge_dict`，4 份结果会被依次合并。**这就是 reducer 存在的意义：处理"多个来源同时更新一个字段"**。你可以把 `snapshot` 的 `Annotated` 去掉，跑一下测试，亲眼看看这个报错。
+2. **为什么必须有 reducer**：4 个并行节点在同一步里都更新了 `snapshot`。没有 reducer 时 LangGraph 会抛出 `InvalidUpdateError`，因为它不知道该保留谁的。有了 `merge_dict`，4 份结果会被依次合并。**这就是 reducer 存在的意义：处理"多个来源同时更新一个字段"**。你可以把 `snapshot` 的 `Annotated` 去掉，启动后端生成一次行程，亲眼看看这个报错。
 3. **`input_schema` / `output_schema`**：子图对外的"接口"。主图的 state 里有 `request` 和 `context`，子图只会读 `request`、只会写回 `context`，内部的 `snapshot`、`tool_status` 不会污染主图。前端类比：组件的 props（输入）和 emit（输出），内部的 data 是私有的。
 4. **为什么 `TOOLS` 存的是 `PlannerContextBuilder.collect_hotels`，而不是 `builder.collect_hotels`**：模块加载时还没有 `builder`（高德客户端要到运行时才从 `runtime.context` 里拿到），所以先存"未绑定方法"，运行时再 `func(builder, request)`，第一个参数就是 `self`。
 
@@ -538,87 +531,7 @@ class GraphTripPlanner:
 
 如果你的 `.env` 里写了 `PLANNER_MODE=context`，改成 `graph` 或者删掉这一行。
 
-## Step 7：测试 `tests/test_graph.py`
-
-```python
-"""P1：LangGraph 版规划器，行为要和第 9 课的 ContextTripPlanner 完全一致"""
-
-import json
-
-import pytest
-
-from app.agents.deps import get_trip_planner
-from app.agents.graph_planner import GraphTripPlanner
-from app.api.main import app
-from app.graph.trip_graph import trip_graph
-from app.models.schemas import TripRequest
-from tests.fakes import FakeLLM, good_plan_json, make_fake_amap
-
-
-def test_graph_structure():
-    # xray=True：把子图也展开画出来
-    mermaid = trip_graph.get_graph(xray=True).draw_mermaid()
-    for node in ["collect", "generate", "validate", "fallback", "attractions", "assemble"]:
-        assert node in mermaid
-
-
-def test_happy_path(trip_request):
-    llm = FakeLLM(replies=[good_plan_json()])
-    result = GraphTripPlanner(make_fake_amap(), llm).plan(TripRequest.model_validate(trip_request))
-    assert result.source == "llm" and result.attempts == 1
-    attraction = result.plan.days[0].attractions[0]
-    assert attraction.ticket_price == 60  # 999 被 hint 覆盖
-    assert attraction.location.longitude == 116.397029
-    assert [w.day_weather for w in result.plan.weather_info] == ["晴", "小雨"]
-
-
-def test_retry_then_success(trip_request):
-    llm = FakeLLM(replies=["我无法完成", TimeoutError("read timeout"), good_plan_json()])
-    result = GraphTripPlanner(make_fake_amap(), llm).plan(TripRequest.model_validate(trip_request))
-    assert result.attempts == 3 and len(result.errors) == 2
-    assert [c["temperature"] for c in llm.calls] == [0.3, 0.4, 0.5]
-    assert "TimeoutError" in llm.calls[2]["messages"][-1].content  # 第 3 次带上了第 2 次的错误
-
-
-def test_all_attempts_fail(trip_request):
-    llm = FakeLLM(replies=["x", "y", "z"])
-    result = GraphTripPlanner(make_fake_amap(), llm).plan(TripRequest.model_validate(trip_request))
-    assert result.source == "fallback" and result.attempts == 3 and len(result.errors) == 3
-
-
-def test_no_attractions_skips_llm(trip_request):
-    llm = FakeLLM(replies=[])
-    result = GraphTripPlanner(make_fake_amap(fail={"poi"}), llm).plan(TripRequest.model_validate(trip_request))
-    assert result.source == "fallback" and llm.calls == []
-    assert "景点数据获取失败" in result.errors[-1]
-
-
-def test_weather_failure_is_a_warning(trip_request):
-    llm = FakeLLM(replies=[good_plan_json()])
-    result = GraphTripPlanner(make_fake_amap(fail={"weather"}), llm).plan(TripRequest.model_validate(trip_request))
-    assert result.source == "llm"
-    assert result.warnings[0] == "weather 数据获取失败"
-
-
-@pytest.mark.parametrize("planner_cls", [GraphTripPlanner])
-def test_stream_api_with_graph(client, trip_request, planner_cls):
-    llm = FakeLLM(replies=["坏输出", good_plan_json()])
-    app.dependency_overrides[get_trip_planner] = lambda: planner_cls(make_fake_amap(), llm)
-    with client.stream("POST", "/api/trip/plan/stream", json=trip_request) as response:
-        events = [json.loads(line[6:]) for line in response.iter_lines() if line.startswith("data: ")]
-    percents = [e["percent"] for e in events if e["type"] == "progress"]
-    assert percents == sorted(percents) and percents[-1] == 100
-    assert "第 2 次生成" in events[-1]["data"]["message"]
-```
-
-```bash
-uv run pytest -q
-# 31 passed
-```
-
-`test_retry_then_success` 是最值得细看的一个：它证明了"重试循环"从 for 循环搬到图的边上之后，temperature 递增、错误反馈这些细节一个都没丢。
-
-## Step 8：看一看你的图
+## Step 7：看一看你的图
 
 ```bash
 uv run python -c "from app.graph.trip_graph import trip_graph; print(trip_graph.get_graph(xray=True).draw_mermaid())"
@@ -661,7 +574,7 @@ plan: TripPlan = structured_llm.invoke(messages)   # 直接拿到 TripPlan，不
 
 ## 📝 课后作业
 
-- [ ] 1. **亲手触发 reducer 报错**：把 `CollectState.snapshot` 的 `Annotated[..., merge_dict]` 改成普通的 `dict[str, Any]`，运行测试，读懂报错信息，再改回来。
+- [ ] 1. **亲手触发 reducer 报错**：把 `CollectState.snapshot` 的 `Annotated[..., merge_dict]` 改成普通的 `dict[str, Any]`，启动后端生成一次行程，读懂报错信息，再改回来。
 - [ ] 2. **加一个节点**：在 `validate` 通过之后、`END` 之前加一个 `summarize` 节点，用代码（不调用大模型）生成一句话摘要写进 `plan.overall_suggestions` 的开头，例如"3 天 7 个景点，预计总花费 4200 元"。想一想：这个节点应该放在 `route_after_validate` 返回 `END` 的位置，路由函数要怎么改？
 - [ ] 3. **试一试结构化输出**：写一个脚本，分别用 `with_structured_output(TripPlan, method="function_calling")` 和现在的方式，用你的真实模型各生成 3 次，记录：成功次数、耗时、业务校验（`validate_plan`）通过次数。把结果记在下面的笔记里。P3 学完评测之后，你会有更系统的方法做这种对比。
 - [ ] 4. **思考题**：`generate` 节点调用大模型失败时，我们把 `draft` 设成 `""`，再由 `route_after_generate` 判断。另一种写法是让异常直接抛出去，用 LangGraph 的节点重试策略 `builder.add_node("generate", generate, retry_policy=RetryPolicy(max_attempts=3))`。两种写法各有什么优缺点？（提示：重试时还能不能把"上次错在哪"告诉模型？哪种错误适合哪种重试？）

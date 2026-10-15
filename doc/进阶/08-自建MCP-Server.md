@@ -7,7 +7,7 @@
 
 **目标**：从"用别人的 MCP"变成"给别人提供 MCP"。学完你会掌握：FastMCP 写 MCP Server（工具、资源、提示模板）、工具设计的原则、结构化输出和错误语义、streamable-http 传输、鉴权、在 LangChain 里以两种方式使用 MCP 工具、工具重试和调用次数限制、外部服务不可用时的降级。
 
-> 本课代码在临时目录里测试过：新增 6 个测试，共 68 个全部通过。测试会**真的启动一个 MCP Server**（随机端口），通过 HTTP 连接它，验证：结构化返回、错误标记 `isError`、资源和提示模板、没有令牌返回 401、修改助手"直接替换失败 → 去 MCP 搜索 → 再替换成功"的完整过程、新候选在下一轮对话里依然可用、MCP 服务挂掉时助手照常工作。调试中发现一个坑：**资源 URI 里的中文会被 URL 编码**（Step 2 要点 5）。**没有接入 Claude Code 实际测试**，Step 6 的命令来自官方文档。
+> 开发中发现一个坑：**资源 URI 里的中文会被 URL 编码**（Step 2 要点 5）。**没有接入 Claude Code 实际验证**，Step 6 的命令来自官方文档。
 
 ## 回顾：MCP 是什么，为什么要自建
 
@@ -52,7 +52,6 @@ app/
 ├── graph/trip_graph.py        ← 修改：assistant 加载 MCP 工具，带回 context
 ├── planner/pricing.py         ← 修改：拆出不依赖 TripRequest 的价格函数
 └── config.py                  ← 修改：MCP 相关配置
-tests/test_mcp.py              ← 新增
 ```
 
 `.env` 追加：
@@ -557,178 +556,6 @@ claude mcp add --transport http trip-data http://127.0.0.1:7002/mcp \
 ```
 
 然后在 Claude Code 里问"帮我查一下杭州有哪些亲子景点，门票多少钱"，它会调用你的 `search_places`。输入 `/` 能看到 `plan_trip` 提示模板，输入 `@` 能引用 `prices://杭州` 资源。**这就是"别的团队的 Agent 复用你的能力"的样子**：你没有为 Claude Code 写一行代码。
-
-## Step 7：测试 `tests/test_mcp.py`
-
-```python
-"""P8：自建 MCP Server，以及主服务通过 MCP 使用它"""
-
-import asyncio
-import json
-import socket
-import threading
-import time
-
-import httpx
-import pytest
-import uvicorn
-from langchain_mcp_adapters.client import MultiServerMCPClient
-
-import mcp_server.server as trip_server
-from app.agents.deps import get_planner_deps
-from app.api.main import app
-from app.graph.state import PlannerDeps
-from app.services import trip_mcp
-from app.services.amap_client import AmapClient
-from tests.fakes import POI_RESPONSE, WEATHER_RESPONSE, FakeLLM, good_plan_json, make_fake_amap, tool_call
-
-TOKEN = "test-token"
-ROAST_DUCK = {"status": "1", "pois": [
-    {"id": "D1", "name": "四季民福烤鸭店(故宫店)", "type": "餐饮服务", "address": "南池子大街", "adname": "东城区",
-     "location": "116.401,39.912", "biz_ext": {"rating": "4.8", "cost": "180.00"}},
-]}
-
-
-def amap_with_roast_duck() -> AmapClient:
-    """假高德：搜"烤鸭"时返回一家新餐厅，其他关键词返回第 11 课的数据"""
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/weather/weatherInfo"):
-            return httpx.Response(200, json=WEATHER_RESPONSE)
-        if request.url.params.get("keywords") == "烤鸭":
-            return httpx.Response(200, json=ROAST_DUCK)
-        if request.url.params.get("keywords") == "坏掉的":
-            return httpx.Response(500)
-        return httpx.Response(200, json=POI_RESPONSE)
-
-    return AmapClient("fake-key", transport=httpx.MockTransport(handler), qps_limit=0)
-
-
-@pytest.fixture(scope="module")  # scope="module"：整个文件只启动一次服务，所有测试共用
-def mcp_url():
-    trip_server.get_amap = amap_with_roast_duck
-    with socket.socket() as s:  # 让操作系统分配一个空闲端口，避免和别的服务冲突
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-    server = uvicorn.Server(uvicorn.Config(trip_server.build_app(TOKEN), port=port, log_level="warning"))
-    threading.Thread(target=server.run, daemon=True).start()
-    while not server.started:
-        time.sleep(0.05)
-    yield f"http://127.0.0.1:{port}/mcp"
-    server.should_exit = True
-
-
-def client_for(url: str, token: str = TOKEN) -> MultiServerMCPClient:
-    return MultiServerMCPClient(
-        {"trip": {"transport": "streamable_http", "url": url, "headers": {"Authorization": f"Bearer {token}"}}}
-    )
-
-
-# ---------- MCP Server 本身 ----------
-
-def test_tools_return_structured_data(mcp_url):
-    async def scenario():
-        async with client_for(mcp_url).session("trip") as session:
-            tools = (await session.list_tools()).tools
-            result = await session.call_tool("search_places", {"city": "北京", "keyword": "博物馆"})
-            return tools, result
-
-    tools, result = asyncio.run(scenario())
-    assert {t.name for t in tools} == {"search_places", "get_weather"}
-    search = next(t for t in tools if t.name == "search_places")
-    assert search.annotations.readOnlyHint is True
-    assert search.outputSchema is not None  # 声明了返回结构，客户端可以据此解析
-    places = result.structuredContent["result"]
-    assert places[0] == {
-        "name": "故宫博物院", "district": "东城区", "address": "景山前街4号",
-        "location": {"longitude": 116.397029, "latitude": 39.917839},
-        "rating": 4.9, "price": 60, "price_source": "price_table",  # 和 PlannerContext 同一套价格口径
-    }
-
-
-def test_tool_error_is_reported(mcp_url):
-    async def scenario():
-        async with client_for(mcp_url).session("trip") as session:
-            return await session.call_tool("search_places", {"city": "北京", "keyword": "坏掉的"})
-
-    result = asyncio.run(scenario())
-    assert result.isError is True  # 第 8 课的 amap-mcp-server 在这里不会标记错误
-    assert "高德查询失败" in result.content[0].text
-    assert "fake-key" not in result.content[0].text  # 第 9 课的教训：错误信息里不能有 Key
-
-
-def test_resource_and_prompt(mcp_url):
-    async def scenario():
-        async with client_for(mcp_url).session("trip") as session:
-            resource = await session.read_resource("prices://北京")
-            prompt = await session.get_prompt("plan_trip", {"city": "北京", "days": "3"})
-            return resource, prompt
-
-    resource, prompt = asyncio.run(scenario())
-    assert "故宫博物院" in json.loads(resource.contents[0].text)
-    assert "search_places" in prompt.messages[0].content.text
-
-
-def test_requires_token(mcp_url):
-    assert httpx.post(mcp_url, json={}).status_code == 401
-    assert httpx.post(mcp_url, json={}, headers={"Authorization": "Bearer wrong"}).status_code == 401
-
-
-# ---------- 主服务通过 MCP 使用它 ----------
-
-@pytest.fixture
-def use_mcp(mcp_url, monkeypatch):
-    monkeypatch.setattr(trip_mcp, "get_trip_mcp_client", lambda: client_for(mcp_url))
-    monkeypatch.setattr(trip_mcp, "_tools_cache", None)
-
-
-def chat(client, thread_id: str, message: str) -> list[dict]:
-    with client.stream("POST", f"/api/trip/{thread_id}/chat", json={"message": message}, headers={"X-User-Id": "u"}) as r:
-        return [json.loads(line[6:]) for line in r.iter_lines() if line.startswith("data: ")]
-
-
-def test_search_then_replace(client, trip_request, use_mcp):
-    llm = FakeLLM(replies=[
-        good_plan_json(),
-        tool_call("replace_meal", day=1, meal_type="dinner", restaurant="四季民福烤鸭店"),  # 候选里没有，失败
-        tool_call("search_more_places", kind="food", keyword="烤鸭"),  # 去 MCP 搜
-        tool_call("replace_meal", day=1, meal_type="dinner", restaurant="四季民福烤鸭店"),  # 再试：成功
-        "第 1 天晚餐换成了四季民福烤鸭店，人均 180 元。",
-    ])
-    app.dependency_overrides[get_planner_deps] = lambda: PlannerDeps(amap=make_fake_amap(), llm=llm)
-    thread_id = client.post("/api/trip/plan", json=trip_request, headers={"X-User-Id": "u"}).json()["thread_id"]
-
-    events = chat(client, thread_id, "第一天晚上想吃烤鸭")
-    results = [e["content"] for e in events if e["type"] == "tool_result"]
-    assert results[0].startswith("修改失败")
-    assert "已加入候选" in results[1]
-    dinner = next(m for m in events[-1]["plan"]["days"][0]["meals"] if m["type"] == "dinner")
-    assert dinner == {"type": "dinner", "name": "四季民福烤鸭店(故宫店)", "estimated_cost": 180}  # 价格来自高德人均
-
-    # 新候选被保存进了会话：下一轮对话还能直接用
-    llm.replies += [tool_call("replace_meal", day=2, meal_type="lunch", restaurant="四季民福烤鸭店"), "好的"]
-    events = chat(client, thread_id, "第二天中午也吃这家")
-    lunch = next(m for m in events[-1]["plan"]["days"][1]["meals"] if m["type"] == "lunch")
-    assert lunch["name"] == "四季民福烤鸭店(故宫店)"
-
-
-def test_mcp_down_degrades_gracefully(client, trip_request, monkeypatch):
-    # 指向一个没有服务的端口：加载工具失败，Agent 照常工作，只是没有搜索和天气工具
-    monkeypatch.setattr(trip_mcp, "get_trip_mcp_client", lambda: client_for("http://127.0.0.1:9/mcp"))
-    monkeypatch.setattr(trip_mcp, "_tools_cache", None)
-    llm = FakeLLM(replies=[good_plan_json(), "第 2 天去故宫博物院。"])
-    app.dependency_overrides[get_planner_deps] = lambda: PlannerDeps(amap=make_fake_amap(), llm=llm)
-    thread_id = client.post("/api/trip/plan", json=trip_request, headers={"X-User-Id": "u"}).json()["thread_id"]
-    assert chat(client, thread_id, "第二天去哪")[-1]["reply"] == "第 2 天去故宫博物院。"
-```
-
-```bash
-uv run pytest -q
-# 68 passed
-```
-
-**`scope="module"` 的 fixture**：启动服务比较慢，整个测试文件只启动一次，所有测试共用。第 11 课用的 fixture 都是默认的 `scope="function"`（每个测试重新创建一次）。
-
-**`test_search_then_replace` 模拟的正是需求卡片里的场景**：模型先尝试直接替换 → 工具说"不在候选里" → 模型去搜索 → 搜到后再替换 → 成功。注意替换时模型写的是"四季民福烤鸭店"，存进行程的是"四季民福烤鸭店(故宫店)"：第 9 课的 `find_candidate` 去掉括号后做了匹配，用的是候选的完整名字和高德的人均价格。
 
 ## 本地开发时同时跑两个服务
 

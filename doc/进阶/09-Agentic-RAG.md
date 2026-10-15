@@ -8,7 +8,7 @@
 
 **目标**：做一个"公司级"的 RAG。你在 `rag/` 项目里已经做过基础的 RAG（Chroma + 切分 + 检索 + 拼 prompt），这节课在那个基础上往前走：按 Markdown 结构切分并带元数据、增量入库、向量 + 关键词混合检索（RRF 融合）、元数据过滤、**检索作为 Agent 的工具（Agentic RAG）**、引用来源、**用知识库里的结构化事实做确定性检查**、检索评测。
 
-> 本课代码在临时目录里测试过：新增 10 个测试，共 78 个全部通过。覆盖：文档解析和切分、增量入库（没变跳过 / 改了替换 / 删了清理）、RRF、按城市过滤、关键词检索、引用格式、闭馆日、规划时提醒闭馆、助手查知识库并带出处、修改后提醒闭馆。**知识库里的 6 篇文档是我编写的示例数据**（每篇开头都有声明），内容可能和现实不一致。**测试用的是只认字面的假 embedding，没有用真实 embedding 模型验证检索效果**，Step 9 让你用真实模型跑一次检索评测。
+> **知识库里的 6 篇文档是我编写的示例数据**（每篇开头都有声明），内容可能和现实不一致。**没有用真实 embedding 模型验证检索效果**，Step 8 让你用真实模型跑一次检索评测。
 
 ## 先对比：你做过的 RAG vs 本课的 RAG
 
@@ -70,7 +70,6 @@ app/
 ├── api/main.py                 ← 修改：启动时创建知识库
 └── config.py                   ← 修改：kb_dir
 evals/rag_dataset.jsonl, evals/rag_eval.py   ← 新增：检索评测
-tests/test_knowledge.py         ← 新增
 ```
 
 ```bash
@@ -742,147 +741,7 @@ def build_edit_agent(llm: BaseChatModel, mcp_tools: list[BaseTool] | None = None
 
 **引用为什么重要**：模型的回答"故宫需要提前 7 天预约 [1]"，前端能把 [1] 渲染成可点击的出处（《故宫博物院游览指南》，更新于 2026-09-01）。用户能核实，出了错也能追溯是哪篇文档写错了，运营去改文档就行，不用改代码或 prompt。
 
-## Step 8：测试 `tests/test_knowledge.py`
-
-```python
-"""P9：攻略知识库"""
-
-import json
-import uuid
-from pathlib import Path
-
-import chromadb
-import pytest
-
-from app.agents.deps import get_planner_deps
-from app.api.main import app
-from app.graph.state import PlannerDeps
-from app.knowledge.base import KnowledgeBase, format_hits, rrf
-from app.knowledge.loader import load_all, load_document, parse_front_matter
-from evals.rag_eval import evaluate_retrieval, load_cases
-from tests.fakes import FakeEmbeddings, FakeLLM, good_plan_json, make_fake_amap, tool_call
-
-
-def make_kb() -> KnowledgeBase:
-    # EphemeralClient：纯内存的 Chroma。同一个进程里所有 EphemeralClient 共享数据，所以每个测试用一个随机的集合名
-    return KnowledgeBase(FakeEmbeddings(), client=chromadb.EphemeralClient(), collection_name=f"kb_{uuid.uuid4().hex}")
-
-
-@pytest.fixture
-def kb() -> KnowledgeBase:
-    kb = make_kb()
-    kb.ingest(load_all())
-    return kb
-
-
-def test_front_matter_and_chunks():
-    meta, body = parse_front_matter("---\ncity: 北京\nclosed_weekdays: 1\n---\n## 标题\n正文")
-    assert meta == {"city": "北京", "closed_weekdays": "1"} and body.strip().startswith("## 标题")
-    chunks = load_document(Path("knowledge/docs/beijing-gugong.md"))
-    assert [c.metadata["section"] for c in chunks] == ["开放时间与闭馆", "预约与门票", "游览路线", "带孩子和老人"]
-    assert all("课程示例数据" not in c.page_content for c in chunks)  # 开头的声明没有入库
-    assert chunks[0].id == "beijing-gugong#0" and chunks[0].metadata["city"] == "北京"
-
-
-def test_incremental_ingest(tmp_path):
-    doc = tmp_path / "a.md"
-    doc.write_text("---\ndoc_id: a\ncity: 北京\n---\n## 一\n第一段\n## 二\n第二段", encoding="utf-8")
-    kb = make_kb()
-    assert kb.ingest(load_all(tmp_path))["added"] == 2
-    assert kb.ingest(load_all(tmp_path))["skipped"] == 1  # 没变化：跳过，不重复调用 embedding（省钱）
-
-    doc.write_text("---\ndoc_id: a\ncity: 北京\n---\n## 一\n改过的第一段", encoding="utf-8")
-    stats = kb.ingest(load_all(tmp_path))
-    assert stats == {"added": 1, "skipped": 0, "removed": 2}  # 旧的两块删掉，写入新的一块
-    assert [d.page_content for d in kb.corpus("北京")] == ["改过的第一段"]
-
-    assert kb.remove_missing(set()) == 1  # 源文件删除了，知识库里也删掉
-    assert kb.corpus("北京") == []
-
-
-def test_rrf():
-    fused = rrf([["a", "b", "c"], ["c", "a"]])
-    assert sorted(fused, key=fused.get, reverse=True) == ["a", "c", "b"]  # a：1+2 名；c：3+1 名；b 只在一路里
-
-
-def test_city_filter(kb):
-    hits = kb.search("周一开放吗", "上海", k=4)
-    assert hits and {h.doc_id for h in hits} == {"shanghai-tips"}  # 只在上海的文档里找
-
-
-def test_keyword_search_finds_exact_term(kb):
-    assert kb.search("珍宝馆", "北京", k=1, mode="keyword")[0].section == "预约与门票"
-
-
-def test_format_hits_has_citations(kb):
-    text = format_hits(kb.search("故宫预约", "北京", k=2))
-    assert text.startswith("[1] 《") and "[2] 《" in text
-    assert format_hits([]) == "知识库里没有找到相关内容。"
-
-
-def test_closures(kb):
-    assert kb.closures("北京") == {"故宫博物院": {1}, "国家博物馆": {1}}
-
-
-def test_rag_eval_runs(kb):
-    result = evaluate_retrieval(kb, load_cases(), "keyword")
-    assert 0 <= result["mrr"] <= result["recall@k"] <= 1
-
-
-# ---------- 接入规划和修改 ----------
-
-@pytest.fixture
-def tuesday_closure_kb(tmp_path) -> KnowledgeBase:
-    """测试数据的行程是 2026-10-06（周二）开始，造一篇"故宫周二闭馆"的文档"""
-    (tmp_path / "g.md").write_text(
-        "---\ndoc_id: g\ntitle: 故宫指南\ncity: 北京\nattraction: 故宫博物院\nclosed_weekdays: 2\nupdated_at: 2026-09-01\n---\n"
-        "## 预约\n故宫需要提前 7 天实名预约，现场不售票。",
-        encoding="utf-8",
-    )
-    kb = make_kb()
-    kb.ingest(load_all(tmp_path))
-    return kb
-
-
-def test_plan_warns_closure(client, trip_request, tuesday_closure_kb):
-    llm = FakeLLM(replies=[good_plan_json()])
-    app.dependency_overrides[get_planner_deps] = lambda: PlannerDeps(amap=make_fake_amap(), llm=llm, kb=tuesday_closure_kb)
-    body = client.post("/api/trip/plan", json=trip_request, headers={"X-User-Id": "u"}).json()
-    assert "注意：第 1 天（2026-10-06 周二）故宫博物院闭馆" in body["message"]  # 闭馆排在所有警告的最前面
-
-
-def test_chat_answers_with_citation(client, trip_request, tuesday_closure_kb):
-    llm = FakeLLM(replies=[
-        good_plan_json(),
-        tool_call("search_travel_guide", query="故宫要预约吗"),
-        "需要，故宫要提前 7 天实名预约，现场不售票 [1]。",
-        tool_call("replace_attraction", day=2, old_name="故宫博物院", new_name="故宫博物院"),
-        "已调整。",
-    ])
-    app.dependency_overrides[get_planner_deps] = lambda: PlannerDeps(amap=make_fake_amap(), llm=llm, kb=tuesday_closure_kb)
-    headers = {"X-User-Id": "u"}
-    thread_id = client.post("/api/trip/plan", json=trip_request, headers=headers).json()["thread_id"]
-
-    with client.stream("POST", f"/api/trip/{thread_id}/chat", json={"message": "故宫要预约吗"}, headers=headers) as r:
-        events = [json.loads(line[6:]) for line in r.iter_lines() if line.startswith("data: ")]
-    result = next(e for e in events if e["type"] == "tool_result")
-    assert result["name"] == "search_travel_guide"
-    assert result["content"].startswith("[1] 《故宫指南》预约（更新于 2026-09-01）")
-    assert events[-1]["reply"].endswith("[1]。")
-
-    # 修改之后，工具结果里会带上闭馆提醒（第 2 天 2026-10-07 是周三，这次没有冲突；第 1 天的冲突依然会被报出来）
-    with client.stream("POST", f"/api/trip/{thread_id}/chat", json={"message": "第二天也去故宫"}, headers=headers) as r:
-        events = [json.loads(line[6:]) for line in r.iter_lines() if line.startswith("data: ")]
-    result = next(e for e in events if e["type"] == "tool_result")
-    assert "注意：第 1 天（2026-10-06 周二）故宫博物院闭馆" in result["content"]
-```
-
-```bash
-uv run pytest -q
-# 78 passed
-```
-
-## Step 9：检索评测
+## Step 8：检索评测
 
 `evals/rag_dataset.jsonl`（16 个问题）：
 

@@ -7,7 +7,7 @@
 
 **目标**：学会做架构决策，而不只是学会写多 Agent。学完你会掌握：三种主流的多 Agent 模式、"子 Agent 作为工具"的实现（上下文隔离、状态回传）、用 `lc_agent_name` 区分不同 Agent 的输出、对话场景的评测方法、ADR 的写法。
 
-> 本课代码在临时目录里测试过：新增 5 个测试，共 83 个全部通过。覆盖：主管委派修改（验证了**专家只看到任务、主管只看到总结**）、委派攻略问答（带引用）、委派交通查询、主管层的预订审批、评测脚本能统计到嵌套在专家里的工具调用。**没有用真实模型跑对话评测**，所以本课**不给结论**：结论要由你跑完评测之后自己写进 ADR。
+> **没有用真实模型跑对话评测**，所以本课**不给结论**：结论要由你跑完评测之后自己写进 ADR。
 
 ## 先回顾：第 8 课到第 9 课发生了什么
 
@@ -74,7 +74,6 @@ app/
 ├── agents/graph_planner.py   ← 修改：只把"和用户对话的 Agent"的文字推给前端
 └── config.py                 ← 修改：assistant_mode
 evals/chat_dataset.jsonl, evals/chat_eval.py   ← 新增：对话评测
-tests/test_supervisor.py      ← 新增
 ```
 
 ## Step 1：交通查询（模拟数据）`app/services/transport.py`
@@ -358,152 +357,7 @@ USER_FACING_AGENTS = {"trip_editor", "trip_assistant"}
 
 注意条件里同时检查了 `langgraph_node == "model"`：`SummarizationMiddleware` 压缩对话时也会调用模型，它所在的节点不叫 `model`，这样它生成的摘要也不会被推给用户。
 
-## Step 6：测试 `tests/test_supervisor.py`
-
-```python
-"""P10：主管 + 专家的多 Agent 版修改助手"""
-
-import json
-
-import pytest
-
-from app.agents.deps import get_planner_deps
-from app.api.main import app
-from app.config import get_settings
-from app.graph.state import PlannerDeps
-from app.services.booking import BookingService
-from tests.fakes import FakeLLM, good_plan_json, make_fake_amap, tool_call
-from tests.test_knowledge import make_kb
-from app.knowledge.loader import load_all
-
-USER = {"X-User-Id": "u"}
-
-
-@pytest.fixture(autouse=True)  # autouse：这个文件里的每个测试都自动使用
-def supervisor_mode(monkeypatch):
-    # get_settings() 有缓存，返回的是同一个对象，直接改它的属性；monkeypatch 会在测试结束后改回去
-    monkeypatch.setattr(get_settings(), "assistant_mode", "supervisor")
-
-
-def start(client, trip_request, llm: FakeLLM, **deps_kwargs) -> str:
-    app.dependency_overrides[get_planner_deps] = lambda: PlannerDeps(amap=make_fake_amap(), llm=llm, **deps_kwargs)
-    return client.post("/api/trip/plan", json=trip_request, headers=USER).json()["thread_id"]
-
-
-def chat(client, thread_id: str, message: str) -> list[dict]:
-    with client.stream("POST", f"/api/trip/{thread_id}/chat", json={"message": message}, headers=USER) as r:
-        return [json.loads(line[6:]) for line in r.iter_lines() if line.startswith("data: ")]
-
-
-def test_delegate_edit(client, trip_request):
-    llm = FakeLLM(replies=[
-        good_plan_json(),
-        tool_call("delegate_edit", task="把第 1 天的晚餐换成国家博物馆"),               # 主管：委派
-        tool_call("replace_meal", day=1, meal_type="dinner", restaurant="国家博物馆"),  # 编辑专家：调用工具
-        "已把第 1 天晚餐换成国家博物馆，餐饮预算有变化。",                               # 编辑专家：总结
-        "好的，第 1 天的晚餐已经换好了。",                                             # 主管：回复用户
-    ])
-    thread_id = start(client, trip_request, llm)
-    events = chat(client, thread_id, "第一天晚上换个地方吃")
-
-    # 只有主管的话推给了用户，专家的总结没有
-    assert "".join(e["text"] for e in events if e["type"] == "token") == "好的，第 1 天的晚餐已经换好了。"
-    # 工具结果带着是哪个 Agent 执行的
-    assert [(e["name"], e["agent"]) for e in events if e["type"] == "tool_result"] == [
-        ("replace_meal", "editor_expert"), ("delegate_edit", "trip_assistant"),
-    ]
-    dinner = next(m for m in events[-1]["plan"]["days"][0]["meals"] if m["type"] == "dinner")
-    assert dinner["name"] == "国家博物馆"
-
-    # 上下文隔离：专家只收到 system prompt + 主管写的任务，没有用户的原话
-    expert_call = llm.calls[2]["messages"]
-    assert [m.type for m in expert_call] == ["system", "human"]
-    assert expert_call[1].content == "把第 1 天的晚餐换成国家博物馆"
-    # 主管第二次思考时，看到的是专家的总结，而不是专家内部的工具调用细节
-    supervisor_view = llm.calls[4]["messages"]
-    assert supervisor_view[-1].type == "tool" and supervisor_view[-1].content.startswith("已把第 1 天晚餐")
-    assert not any(getattr(m, "name", None) == "replace_meal" for m in supervisor_view)
-
-
-def test_ask_guide(client, trip_request):
-    kb = make_kb()
-    kb.ingest(load_all())
-    llm = FakeLLM(replies=[
-        good_plan_json(),
-        tool_call("ask_guide", question="故宫需要预约吗"),
-        tool_call("search_travel_guide", query="故宫 预约"),
-        "需要提前 7 天实名预约，现场不售票 [1]。",
-        "故宫需要提前 7 天实名预约，现场不售票 [1]。",
-    ])
-    thread_id = start(client, trip_request, llm, kb=kb)
-    events = chat(client, thread_id, "故宫要预约吗")
-    guide = next(e for e in events if e["type"] == "tool_result" and e["name"] == "search_travel_guide")
-    assert guide["agent"] == "guide_expert" and guide["content"].startswith("[1] 《")
-    assert events[-1]["reply"].endswith("[1]。")
-
-
-def test_ask_transport(client, trip_request):
-    llm = FakeLLM(replies=[
-        good_plan_json(),
-        tool_call("ask_transport", task="上海到北京，2026-10-06，高铁"),
-        tool_call("search_transport", origin="上海", destination="北京", date="2026-10-06"),
-        "推荐 G 字头早班车。",
-        "推荐你坐早上的高铁。",
-    ])
-    thread_id = start(client, trip_request, llm)
-    events = chat(client, thread_id, "我从上海出发，看看高铁")
-    result = next(e for e in events if e["name"] == "search_transport" if e["type"] == "tool_result")
-    assert "模拟数据" in result["content"] and result["content"].count("元") == 4  # 4 个车次
-
-
-def test_booking_still_needs_approval(client, trip_request):
-    booking = BookingService()
-    llm = FakeLLM(replies=[
-        good_plan_json(),
-        tool_call("book_hotel", hotel_name="故宫博物院", check_in="2026-10-06", nights=1, rooms=1),
-        "已为你预订。",
-    ])
-    thread_id = start(client, trip_request, llm, booking=booking)
-    events = chat(client, thread_id, "帮我订酒店")
-    question = next(e for e in events if e["type"] == "interrupt")
-    assert question["kind"] == "approval" and booking.orders == {}
-    with client.stream("POST", f"/api/trip/{thread_id}/resume", json={"interrupt_id": question["id"], "decision": "approve"},
-                       headers=USER) as r:
-        r.read()
-    assert len(booking.orders) == 1
-
-
-def test_chat_eval_counts_nested_tools(trip_request):
-    """评测脚本本身也要测：嵌套在专家里的工具调用和模型调用都要统计到"""
-    import asyncio
-
-    from app.agents.output import parse_and_check
-    from app.models.schemas import TripRequest
-    from app.planner.context import PlannerContextBuilder
-    from evals.chat_eval import run_case
-
-    request = TripRequest.model_validate(trip_request)
-    base = {"request": request, "context": json.loads(json.dumps(PlannerContextBuilder(make_fake_amap()).collect(request))),
-            "plan": parse_and_check(good_plan_json(), request)}
-    llm = FakeLLM(replies=[
-        tool_call("delegate_edit", task="第 1 天晚餐换成国家博物馆"),
-        tool_call("replace_meal", day=1, meal_type="dinner", restaurant="国家博物馆"),
-        "换好了", "好的",
-    ])
-    case = {"id": "swap", "message": "换晚餐", "expect_any": ["replace_meal"]}
-    row = asyncio.run(run_case(case, base, PlannerDeps(amap=None, llm=llm, interactive=False)))
-    assert row["tool_ok"] and row["tools"] == ["delegate_edit", "replace_meal"]
-    assert row["llm_calls"] == 4  # 主管 2 次 + 编辑专家 2 次：这就是多 Agent 的成本
-```
-
-```bash
-uv run pytest -q
-# 83 passed
-```
-
-`test_delegate_edit` 里的断言值得细看，它把多 Agent 的三个关键特性都验证了：只有主管的话推给用户；专家只看到任务（`["system", "human"]`）；主管只看到专家的总结。最后一个测试里的 `llm_calls == 4` 直观地说明了成本：**同样是"换一个晚餐"，单 Agent 调用 2 次模型，多 Agent 调用 4 次**。
-
-## Step 7：对话评测
+## Step 6：对话评测
 
 `evals/chat_dataset.jsonl`：
 
@@ -661,7 +515,7 @@ uv run python -m evals.chat_eval --mode supervisor
 2. **用回调统计**：`on_tool_start` 会在**任何一层**的工具开始执行时触发，所以专家内部调用的 `replace_meal` 也能统计到。
 3. **`train-ask-origin`（"帮我看看高铁"）期望不调用任何工具**：用户没说从哪出发，正确的做法是先问。这类"不该做什么"的用例和"该做什么"一样重要。
 
-## Step 8：写 ADR（架构决策记录）
+## Step 7：写 ADR（架构决策记录）
 
 ADR（Architecture Decision Record）是公司里记录"为什么这样设计"的标准文档。半年后有人问"为什么不用多 Agent"，翻 ADR 就有答案，不用靠人记忆。在 `doc/进阶/` 下新建 `ADR-001-修改助手的Agent架构.md`，模板如下：
 
