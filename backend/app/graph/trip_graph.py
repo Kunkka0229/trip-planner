@@ -80,6 +80,10 @@ def fallback(state: TripState) -> dict[str, Any]:
 
 # ---------- 路由函数：读 state，返回下一个节点的名字 ----------
 # 返回值类型写成 Literal：LangGraph 会据此知道"可能去哪些节点"，画图时能画出所有分支
+def route_start(state: TripState) -> Literal["collect", "generate", "fallback"]:
+    """P3：调用方已经带了 context（评测时用冻结的 context）就跳过 collect，直接进入后面的流程"""
+    return route_after_collect(state) if state.get("context") else "collect"
+
 def route_after_collect(state: TripState) -> Literal["generate", "fallback"]:
     # 景点是行程的核心：没有景点候选就不调用大模型（第 9 课的规则）
     return "generate" if state["context"]["tool_snapshot"]["attraction_pois"] else "fallback"
@@ -102,7 +106,8 @@ def build_trip_graph():
     builder.add_node("validate", validate)
     builder.add_node("fallback", fallback)
 
-    builder.add_edge(START, "collect")
+    # P3：入口也可以是条件边。正常请求走 collect；评测时传入冻结的 context，直接去 generate
+    builder.add_conditional_edges(START, route_start)
     # 条件边：执行完 collect 后，调用 route_after_collect，按返回值决定去哪
     # 相当于前端路由守卫：beforeEach((to) => hasData ? next() : next('/fallback'))
     builder.add_conditional_edges("collect", route_after_collect)
