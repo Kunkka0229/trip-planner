@@ -4,6 +4,7 @@
   多 Agent：大模型决定调用什么工具 → 结果被总结成自然语言 → 工具出错也没人知道
   Context：代码决定调用什么工具（并行执行）→ 保留结构化数据 → 每个工具的成败都记在 tool_status 里
 """
+import logging
 import math
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -13,6 +14,8 @@ from app.agents.output import trip_dates
 from app.models.schemas import POIInfo, TripRequest, WeatherInfo
 from app.planner.pricing import hotel_cost_hint, meal_cost_hint, ticket_price_hint
 from app.services.amap_client import AmapClient
+
+logger = logging.getLogger(__name__)
 
 def poi_row(poi: POIInfo, **hints: Any) -> dict[str, Any]:
     """POI → 给大模型看的精简 dict，**hints 用来附加价格提示等字段（相当于 JS 的 ...rest）"""
@@ -97,7 +100,7 @@ class PlannerContextBuilder:
                 except Exception as exc:
                     # 关键：失败被明确记录下来，而不是像多 Agent 版那样变成一段自然语言
                     tool_status[name] = {"ok": False, "error": str(exc)}
-                    print(f"⚠️  工具 {name} 失败: {exc}")
+                    logger.warning("工具 %s 失败: %s", name, exc)
     
         return assemble_context(request, snapshot, tool_status)
     

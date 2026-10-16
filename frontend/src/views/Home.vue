@@ -80,6 +80,12 @@ async function handleSubmit() {
     // 第 10 课：请求也存一份，结果页编辑行程后重算预算要用到人数
     sessionStorage.setItem('tripRequest', JSON.stringify(request))
     sessionStorage.setItem('tripMessage', result.message)
+    // P2：结果页提交反馈时要用 trace_id；没启用 Langfuse 时是 null，删掉旧值，结果页就不显示反馈按钮
+    if (result.traceId) {
+      sessionStorage.setItem('tripTraceId', result.traceId)
+    } else {
+      sessionStorage.removeItem('tripTraceId')
+    }
     // 后端返回的是兜底方案（第 7 课），或者带有警告（第 9 课）时，用黄色提示
     if (result.message.includes('基础行程') || result.message.includes('注意')) {
       message.warning(result.message, 6)

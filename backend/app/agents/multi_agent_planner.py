@@ -12,6 +12,7 @@
   多 Agent 版：由大模型决定调用什么工具、传什么参数，拿到的是大模型整理后的自然语言
 """
 import asyncio
+import logging
 import threading
 from functools import lru_cache
 from typing import TypedDict
@@ -32,6 +33,8 @@ from app.agents.prompts import (
 )
 from app.models.schemas import TripRequest
 from app.services.amap_mcp import get_amap_mcp_client
+
+logger = logging.getLogger(__name__)
 
 # State：整张图共享的"状态"，每个节点读取它，并返回自己要更新的那几个字段
 # 前端类比：Redux/Pinia 的 store。节点返回的 dict 会被合并进 state，类似 setState({...})
@@ -90,19 +93,19 @@ class MultiAgentTripPlanner:
         async def attraction_node(state: TripState) -> TripState:
             request = state["request"]
             preferences = "、".join(request.preferences) or "热门"
-            print("🔍 景点 Agent 工作中...")
+            logger.info("景点 Agent 工作中")
             
             answer = await self._ask(search_tools, ATTRACTION_AGENT_PROMPT, f"搜索{request.city}的{preferences}景点")
             return {"attractions": answer}
         
         async def weather_node(state: TripState) -> TripState:
-            print("🌤️  天气 Agent 工作中...")
+            logger.info("天气 Agent 工作中")
             answer = await self._ask(weather_tools, WEATHER_AGENT_PROMPT, f"查询{state['request'].city}的天气")
             return {"weather": answer}
         
         async def hotel_node(state: TripState) -> TripState:
             request = state["request"]
-            print("🏨 酒店 Agent 工作中...")
+            logger.info("酒店 Agent 工作中")
             answer = await self._ask(search_tools, HOTEL_AGENT_PROMPT, f"搜索{request.city}的{request.accommodation}")
             return {"hotels": answer}
         
@@ -119,7 +122,7 @@ class MultiAgentTripPlanner:
                 weather_json=state["weather"],
                 dates=trip_dates(request),
             )
-            print("📋 规划 Agent 工作中...")
+            logger.info("规划 Agent 工作中")
             return {"result": generate_plan_with_retries(self.llm, prompt, request, on_progress=on_progress)}
         
         # ---------- 把节点连成图 ----------

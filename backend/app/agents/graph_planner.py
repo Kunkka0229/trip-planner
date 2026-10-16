@@ -8,6 +8,7 @@ from app.graph.state import PlannerDeps, TripState
 from app.graph.trip_graph import trip_graph
 from app.models.schemas import TripRequest
 from app.services.amap_client import AmapClient
+from app.observability.tracing import langchain_callbacks
 
 def progress_of(node: str, update: dict) -> tuple[str, int] | None:
     """节点执行完 → 要上报的进度。返回 None 表示这一步不上报"""
@@ -33,13 +34,22 @@ class GraphTripPlanner:
         #   "updates"：某个节点刚执行完，数据是 {节点名: 这个节点返回的更新}，用来上报进度
         #   "values"：每一步执行完后的完整 state，最后一次就是最终结果
         
-        for mode, chunk in trip_graph.stream({"request": request}, context=self.deps, stream_mode=["updates", "values"]):
+        # config：LangChain 体系里通用的"调用配置"，回调、标签、递归上限都放这里
+        #   callbacks：P2 接入 Langfuse，图的每一步都会被记录下来；没配置时是空列表
+        #   run_name：这一层在 trace 里显示的名字
+        #   recursion_limit：P1 讲过的兜底，防止图里的环失控
+        config = {"callbacks": langchain_callbacks(), "run_name": "trip_graph", "recursion_limit": 20}
+        stream = trip_graph.stream(
+            {"request": request}, config=config, context=self.deps, stream_mode=["updates", "values"]
+        )
+        for mode, chunk in stream:
             if mode == "values":
                 final = chunk
                 continue
             for node, update in chunk.items():
                 if progress := progress_of(node, update or {}):
                     on_progress(*progress)
+        
         on_progress("完成", 100)
         return PlanResult(
             plan=final["plan"],

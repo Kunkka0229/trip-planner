@@ -222,6 +222,7 @@ class TripPlanResponse(BaseModel):
     success: bool
     message: str = ""
     data: TripPlan | None = None  # 失败时 data 为 null
+    trace_id: str | None = None  # P2：这次生成对应的 Langfuse trace，前端提交反馈时带回来
 
 # ============================================================
 # 高德相关模型（第 5 课新增）
@@ -245,3 +246,11 @@ class ApiResponse[T](BaseModel):
     success: bool = True
     message: str = ""
     data: T | None = None
+    
+# ============================================================
+# 用户反馈（P2 新增）
+# ============================================================
+class FeedbackRequest(BaseModel):
+    trace_id: str = Field(..., min_length=32, max_length=32, description="生成行程时返回的 trace_id")
+    helpful: bool = Field(..., description="这份行程有没有帮助（👍 / 👎）")
+    comment: str = Field(default="", max_length=500, description="可选的文字反馈")

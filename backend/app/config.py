@@ -66,6 +66,13 @@ class Settings(BaseSettings):
     planner_mode: Literal["graph", "context", "direct", "multi_agent"] = "graph"
 
     amap_qps_limit: float = 3  # 高德每秒最多请求几次，个人开发者 Key 的并发上限比较低；0 = 不限速
+
+    app_env: str = "dev"  # 运行环境：dev / prod（P2）
+
+    # ---------- 可观测性（P2）----------
+    langfuse_public_key: str = ""  # 留空 = 不启用 Langfuse
+    langfuse_secret_key: str = ""
+    langfuse_base_url: str = "http://localhost:3000"
     
     # @property：把方法变成"只读属性"，调用时不用加括号：settings.cors_origins_list
     # 类似 JS class 里的 get corsOriginsList() { ... }

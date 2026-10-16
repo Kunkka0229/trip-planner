@@ -9,6 +9,7 @@ START ──┼→ foods       ┼→ assemble → END
 每个工具还会在 trace（P2）里单独显示成一个节点，耗时和报错一目了然
 """
 
+import logging
 from typing import Annotated, Any, Callable, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -17,6 +18,8 @@ from langgraph.runtime import Runtime
 from app.graph.state import PlannerDeps
 from app.models.schemas import TripRequest
 from app.planner.context import PlannerContextBuilder, assemble_context, empty_snapshot
+
+logger = logging.getLogger(__name__)  # __name__ 是模块名，例如 app.graph.collect，日志里会显示出来
 
 def merge_dict(old: dict, new: dict) -> dict:
     """reducer：把新字典合并进旧字典。4 个并行节点各自返回一部分，最后拼成一个完整的字典"""
@@ -56,7 +59,7 @@ def make_tool_node(name: str, func: Callable):
             result = func(builder, state["request"])
         except Exception as exc:
             # 和第 9 课一样：失败只记录在 tool_status 里，不影响其他工具
-            print(f"⚠️  工具 {name} 失败: {exc}")
+            logger.warning("工具 %s 失败: %s", name, exc)
             return {"tool_status": {name: {"ok": False, "error": str(exc)}}}
         
         count = len(next(iter(result.values())))

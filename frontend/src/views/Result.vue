@@ -3,6 +3,7 @@ import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import TripMap from '@/components/TripMap.vue'
+import { submitFeedback } from '@/services/api'
 import type { TripPlan, TripRequest, WeatherInfo } from '@/types'
 import { recomputeBudget } from '@/utils/budget'
 import { exportAsImage, exportAsPdf } from '@/utils/export'
@@ -130,6 +131,41 @@ async function handleExport(type: 'image' | 'pdf') {
     exporting.value = false
   }
 }
+
+// ---------- P2：用户反馈（👍 / 👎） ----------
+// 首页存进来的 trace_id；没启用 Langfuse 时没有，反馈按钮就不显示
+const traceId = sessionStorage.getItem('tripTraceId')
+// 已经反馈过的 trace_id 记在 sessionStorage 里：刷新页面后不会让用户重复提交
+const FEEDBACK_DONE_KEY = 'tripFeedbackDone'
+const feedbackDone = ref(traceId !== null && sessionStorage.getItem(FEEDBACK_DONE_KEY) === traceId)
+const feedbackSubmitting = ref(false)
+const dislikeOpen = ref(false) // 👎 的原因输入框是否打开
+const dislikeComment = ref('')
+
+async function sendFeedback(helpful: boolean, comment = '') {
+  if (!traceId) return
+  feedbackSubmitting.value = true
+  try {
+    const result = await submitFeedback({ trace_id: traceId, helpful, comment })
+    if (result.success) {
+      feedbackDone.value = true
+      sessionStorage.setItem(FEEDBACK_DONE_KEY, traceId)
+      dislikeOpen.value = false
+      message.success('感谢你的反馈')
+    } else {
+      message.info(result.message) // 后端没启用 Langfuse 时 success=false
+    }
+  } catch (e) {
+    message.error((e as Error).message) // api.ts 已经附上了 request_id
+  } finally {
+    feedbackSubmitting.value = false
+  }
+}
+
+function openDislike() {
+  dislikeComment.value = ''
+  dislikeOpen.value = true
+}
 </script>
 
 <template>
@@ -167,6 +203,16 @@ async function handleExport(type: 'image' | 'pdf') {
           <p>{{ plan.start_date }} 至 {{ plan.end_date }} · {{ people }} 人</p>
           <a-alert v-if="notice" :message="notice" type="info" show-icon style="margin-bottom: 12px" />
           <p>{{ plan.overall_suggestions }}</p>
+
+          <!-- P2：反馈。没有 trace_id（没启用 Langfuse）时不显示；导出图片 / PDF 时忽略 -->
+          <div v-if="traceId" class="feedback" data-export-ignore>
+            <span v-if="feedbackDone" class="feedback-done">✅ 已收到你的反馈，谢谢！</span>
+            <template v-else>
+              <span>这份行程对你有帮助吗？</span>
+              <a-button size="small" :loading="feedbackSubmitting" @click="sendFeedback(true)">👍 有帮助</a-button>
+              <a-button size="small" :disabled="feedbackSubmitting" @click="openDislike">👎 没帮助</a-button>
+            </template>
+          </div>
         </a-card>
 
         <!-- 预算（书 13.6.1） -->
@@ -245,6 +291,24 @@ async function handleExport(type: 'image' | 'pdf') {
       </div>
     </a-col>
   </a-row>
+
+  <!-- P2：点 👎 时收集原因。原因可以不填，但填了对改进最有用 -->
+  <a-modal
+    v-model:open="dislikeOpen"
+    title="哪里不满意？"
+    ok-text="提交"
+    cancel-text="取消"
+    :confirm-loading="feedbackSubmitting"
+    @ok="sendFeedback(false, dislikeComment.trim())"
+  >
+    <a-textarea
+      v-model:value="dislikeComment"
+      :maxlength="500"
+      show-count
+      :rows="4"
+      placeholder="比如：第三天是空的、景点太赶、预算超了……（选填）"
+    />
+  </a-modal>
 </template>
 
 <style scoped>
@@ -266,5 +330,18 @@ async function handleExport(type: 'image' | 'pdf') {
 
 .weather-hint {
   font-size: 12px;
+}
+
+.feedback {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px dashed #f0f0f0;
+}
+
+.feedback-done {
+  color: rgba(0, 0, 0, 0.45);
 }
 </style>

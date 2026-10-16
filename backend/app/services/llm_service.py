@@ -1,10 +1,13 @@
 """大模型服务：创建并共享一个 ChatOpenAI 实例"""
 
+import logging
 from functools import lru_cache
 
 from langchain_openai import ChatOpenAI
 
 from app.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 class LLMNotConfiguredError(Exception):
     """没有配置大模型 Key 时抛出"""
@@ -27,5 +30,5 @@ def get_llm() -> ChatOpenAI:
         # 设成 1：第 7 课我们会自己写"格式不合格就重试"的循环，两层重试叠加，最坏情况会等很久
         max_retries=1,
     )
-    print(f"✅ LLM 初始化成功: model={llm.model_name}, base_url={settings.llm_base_url}")
+    logger.info("LLM 初始化成功: model=%s, base_url=%s", llm.model_name, settings.llm_base_url)
     return llm

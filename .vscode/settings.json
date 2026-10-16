@@ -1,3 +1,10 @@
 {
-  "python.defaultInterpreterPath": "${workspaceFolder}/backend/.venv/bin/python"
+  "python.defaultInterpreterPath": "${workspaceFolder}/backend/.venv/bin/python",
+  // Python 文件统一用 4 个空格缩进：按 Tab 键插入 4 个空格，不插入制表符
+  "[python]": {
+    "editor.tabSize": 4,
+    "editor.insertSpaces": true,
+    // 关掉"根据文件内容猜缩进"，否则打开一个混了 Tab 的文件时会被带偏
+    "editor.detectIndentation": false
+  }
 }

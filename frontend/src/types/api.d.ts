@@ -89,6 +89,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/trip/feedback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 对生成的行程打分（👍 / 👎） */
+        post: operations["submit_feedback_api_trip_feedback_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/poi/search": {
         parameters: {
             query?: never;
@@ -320,6 +337,25 @@ export interface components {
              */
             meals?: components["schemas"]["Meal"][];
         };
+        /** FeedbackRequest */
+        FeedbackRequest: {
+            /**
+             * Trace Id
+             * @description 生成行程时返回的 trace_id
+             */
+            trace_id: string;
+            /**
+             * Helpful
+             * @description 这份行程有没有帮助（👍 / 👎）
+             */
+            helpful: boolean;
+            /**
+             * Comment
+             * @description 可选的文字反馈
+             * @default
+             */
+            comment: string;
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -507,6 +543,8 @@ export interface components {
              */
             message: string;
             data?: components["schemas"]["TripPlan"] | null;
+            /** Trace Id */
+            trace_id?: string | null;
         };
         /**
          * TripRequest
@@ -721,7 +759,9 @@ export interface operations {
     plan_trip_api_trip_plan_post: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                "X-User-Id"?: string;
+            };
             path?: never;
             cookie?: never;
         };
@@ -754,13 +794,48 @@ export interface operations {
     plan_trip_stream_api_trip_plan_stream_post: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                "X-User-Id"?: string;
+            };
             path?: never;
             cookie?: never;
         };
         requestBody: {
             content: {
                 "application/json": components["schemas"]["TripRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_feedback_api_trip_feedback_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FeedbackRequest"];
             };
         };
         responses: {

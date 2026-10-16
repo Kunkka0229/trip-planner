@@ -3,6 +3,7 @@
 为什么要抽出来？第 8 课的多 Agent 版本和第 7 课的直连版本，最后一步都是
 "把一个 prompt 交给规划 Agent，拿到合格的 TripPlan"。同样的逻辑不应该写两遍
 """
+import logging
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -14,6 +15,8 @@ from app.agents.prompts import PLANNER_SYSTEM_PROMPT
 from app.agents.progress import ProgressFn, no_progress
 from app.models.schemas import TripPlan, TripRequest
 from app.services.mock_planner import build_mock_plan
+
+logger = logging.getLogger(__name__)
 
 # 最多调用大模型几次
 MAX_ATTEMPTS = 3
@@ -68,14 +71,14 @@ def generate_plan_with_retries(
             # 只保留第一行，Pydantic 的错误信息可能很长
             reason = f"{type(exc).__name__}: {str(exc).splitlines()[0]}"
             errors.append(reason)
-            print(f"⚠️  第 {attempt}/{MAX_ATTEMPTS} 次失败: {reason}")
+            logger.warning("第 %d/%d 次失败: %s", attempt, MAX_ATTEMPTS, reason)
             continue
             
-        print(f"✅ 第 {attempt} 次生成成功")
+        logger.info("第 %d 次生成成功", attempt)
         return PlanResult(plan=plan, source="llm", attempts=attempt, errors=errors, warnings=warnings)
         
     # 所有重试都失败了：返回兜底方案，而不是直接报错。用户至少能看到一个能用的结果
-    print("❌ 大模型多次生成失败，返回兜底方案")
+    logger.error("大模型多次生成失败，返回兜底方案")
     return PlanResult(
         plan=build_fallback(request, "大模型多次生成失败"),
         source="fallback",

@@ -1,5 +1,7 @@
 """FastAPI 主应用：创建 app、挂中间件、注册路由"""
-from contextlib import asynccontextmanager  # 用来写 lifespan 的工具
+import logging
+from contextlib import asynccontextmanager
+import uuid  # 用来写 lifespan 的工具
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -10,8 +12,13 @@ from app.api.routes import map as map_routes  # map 和 Python 内置函数 map(
 from app.services.amap_client import AmapError
 
 from app.config import get_settings
+from app.observability.logs import setup_logging, request_id_var
+from app.observability.tracing import shutdown_tracing
+
+logger = logging.getLogger(__name__)
 
 settings = get_settings()  # 取配置中心的配置对象
+setup_logging(settings.log_level)  # P2：在创建 app 之前配置好日志
 
 def status_of(value: str) -> str:
     """密钥只显示"已配置/未配置"，避免在日志里泄露"""
@@ -24,15 +31,14 @@ def status_of(value: str) -> str:
 # 参考仓库用的 @app.on_event("startup") 是旧写法，FastAPI 已经不推荐使用
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("=" * 50)  # 字符串乘法：把 "=" 重复 50 次
-    print(f"🚀 {settings.app_name} v{settings.app_version}")
-    print(f"   监听地址: {settings.host}:{settings.port}")
-    print(f"   高德 Key: {status_of(settings.amap_api_key)}")
-    print(f"   LLM Key : {status_of(settings.llm_api_key)}")
-    print(f"   CORS 允许: {settings.cors_origins_list}")
-    print("=" * 50)
+    # 启动横幅也换成 logger：和其他日志格式统一、带时间戳；部署后进入日志平台，能查到"服务什么时候重启过、当时用的什么配置"
+    # 去掉了 "=" 分隔线：日志平台按行收集，装饰性的分隔线只会变成几条没有内容的日志
+    logger.info("%s v%s 启动，监听地址 %s:%s", settings.app_name, settings.app_version, settings.host, settings.port)
+    logger.info("高德 Key: %s，LLM Key: %s", status_of(settings.amap_api_key), status_of(settings.llm_api_key))
+    logger.info("CORS 允许: %s", settings.cors_origins_list)
     yield  # ← 服务在这里运行，直到收到关闭信号
-    print("👋 服务已关闭")
+    shutdown_tracing()  # P2：把还没上报的 trace 发完再退出
+    logger.info("服务已关闭")
     
 # 创建应用：标题和版本从配置读取，生命周期交给 lifespan
 app = FastAPI(
@@ -53,7 +59,23 @@ app.add_middleware(
     allow_credentials=True,                    # 允许携带 cookie
     allow_methods=["*"],                       # 允许所有 HTTP 方法（GET/POST/...）
     allow_headers=["*"],                       # 允许所有请求头
+    expose_headers=["X-Request-ID"],           # P2：跨域时前端 JS 默认读不到自定义响应头，要显式暴露
 )
+
+# ---------- request_id 中间件（P2）----------
+# 每个请求分配一个 ID：优先用调用方传来的 X-Request-ID（网关、前端都可能传），没有就生成一个
+# 这个 ID 会出现在：本次请求的每一行日志、响应头、Langfuse 的 trace_id（由它算出来）
+# 用户报错时只要把响应头里的 X-Request-ID 发给你，就能找到这次请求的全部信息
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+    token = request_id_var.set(request_id)  # set 返回一个 token，用来在结束时恢复原值
+    try:
+        response = await call_next(request)  # 交给后面的中间件和路由处理，相当于 Express 的 next()
+    finally:
+        request_id_var.reset(token)
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 # ---------- 全局异常处理器 ----------
 # 任何路由里抛出 AmapError，都会被这里接住，转成 502 + {"detail": "..."}

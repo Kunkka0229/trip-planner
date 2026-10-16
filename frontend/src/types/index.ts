@@ -22,6 +22,8 @@ export type PartyInfo = Schemas['PartyInfo']
 export type BudgetConstraint = Schemas['BudgetConstraint']
 // 从字段上取类型：后端 Literal['hard', 'soft', 'none'] → 'hard' | 'soft' | 'none'
 export type BudgetStrictness = BudgetConstraint['strictness']
+// P2：用户反馈的请求体 { trace_id, helpful, comment }
+export type FeedbackRequest = Schemas['FeedbackRequest']
 
 // ============ 响应（都套一层 Resp，去掉多余的 ?）============
 

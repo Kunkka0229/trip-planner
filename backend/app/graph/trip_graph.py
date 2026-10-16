@@ -9,6 +9,7 @@ START → collect ──有景点──→ generate ──有输出──→ val
 """
 
 import json
+import logging
 from typing import Any, Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -23,6 +24,8 @@ from app.graph.state import PlannerDeps, TripState
 from app.models.schemas import WeatherInfo
 from app.planner.context import compact_for_prompt
 from app.planner.grounding import ground_plan
+
+logger = logging.getLogger(__name__)  # __name__ 是模块名，例如 app.graph.trip_graph，日志里会显示出来
 
 def error_reason(exc: Exception) -> str:
     """异常 → 一行简短的原因（和第 7 课 generate_plan_with_retries 里的写法一样）"""
@@ -43,7 +46,7 @@ def generate(state: TripState, runtime: Runtime[PlannerDeps]) -> dict[str, Any]:
             [SystemMessage(PLANNER_SYSTEM_PROMPT), HumanMessage(prompt)], temperature=temperature
         ).text
     except Exception as exc:  # 超时、网络错误：记一次失败，draft 置空
-        print(f"⚠️  第 {attempt}/{MAX_ATTEMPTS} 次调用失败: {error_reason(exc)}")
+        logger.warning("第 %d/%d 次调用失败: %s", attempt, MAX_ATTEMPTS, error_reason(exc))
         return {"attempts": attempt, "draft": "", "errors": [error_reason(exc)]}
     
     return {"attempts": attempt, "draft": draft}
@@ -57,10 +60,10 @@ def validate(state: TripState) -> dict[str, Any]:
         plan.weather_info = [WeatherInfo(**w) for w in context["tool_snapshot"]["trip_weather"]]
         plan.budget = recompute_budget(plan, request)
     except Exception as exc:
-        print(f"⚠️  第 {state['attempts']}/{MAX_ATTEMPTS} 次校验失败: {error_reason(exc)}")
+        logger.warning("第 %d/%d 次校验失败: %s", state["attempts"], MAX_ATTEMPTS, error_reason(exc))
         return {"errors": [error_reason(exc)]}
     
-    print(f"📍 Grounding: 景点命中率 {stats['attraction_rate']:.0%}，未匹配 {stats['ungrounded']}")
+    logger.info("Grounding: 景点命中率 %.0f%%，未匹配 %s", stats["attraction_rate"] * 100, stats["ungrounded"])
     status = context["tool_status"]
     warnings = [f"{name} 数据获取失败" for name, s in status.items() if not s["ok"]]
     warnings += [f"{name} 不在高德候选中" for name in dict.fromkeys(stats["ungrounded"])]
@@ -72,7 +75,7 @@ def fallback(state: TripState) -> dict[str, Any]:
         error = state["context"]["tool_status"].get("attractions", {}).get("error", "没有搜到景点")
         reason = f"景点数据获取失败: {error}"
         return {"plan": build_fallback(request, reason), "source": "fallback", "errors": [reason]}
-    print("❌ 大模型多次生成失败，返回兜底方案")
+    logger.error("大模型多次生成失败，返回兜底方案")
     return {"plan": build_fallback(request, "大模型多次生成失败"), "source": "fallback"}
 
 # ---------- 路由函数：读 state，返回下一个节点的名字 ----------
