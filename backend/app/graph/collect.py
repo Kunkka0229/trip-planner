@@ -10,8 +10,9 @@ START ──┼→ foods       ┼→ assemble → END
 """
 
 import logging
-from typing import Annotated, Any, Callable, TypedDict
+from typing import Annotated, Any, Awaitable, Callable, TypedDict
 
+from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
 
@@ -39,13 +40,14 @@ class CollectInput(TypedDict):
 class CollectOutput(TypedDict):
     context: dict[str, Any]
 
-# 工具名 → PlannerContextBuilder 上的方法（第 9 课写好的，P1 只是把下划线去掉变成公开方法）
-# PlannerContextBuilder.collect_hotels 是"未绑定方法"，调用时要手动传 self：func(builder, request)
-TOOLS: dict[str, Callable[[PlannerContextBuilder, TripRequest], dict[str, Any]]] = {
-    "attractions": PlannerContextBuilder.collect_attractions,
-    "hotels": PlannerContextBuilder.collect_hotels,
-    "foods": PlannerContextBuilder.collect_foods,
-    "weather": PlannerContextBuilder.collect_weather,
+# 工具名 → PlannerContextBuilder 上的方法
+# PlannerContextBuilder.acollect_hotels 是"未绑定方法"，调用时要手动传 self：func(builder, request)
+# P4：换成异步版本（acollect_xxx），返回值是协程，要 await
+TOOLS: dict[str, Callable[[PlannerContextBuilder, TripRequest], Awaitable[dict[str, Any]]]] = {
+    "attractions": PlannerContextBuilder.acollect_attractions,
+    "hotels": PlannerContextBuilder.acollect_hotels,
+    "foods": PlannerContextBuilder.acollect_foods,
+    "weather": PlannerContextBuilder.acollect_weather,
 }
 
 def make_tool_node(name: str, func: Callable):
@@ -53,16 +55,22 @@ def make_tool_node(name: str, func: Callable):
     
     # runtime: Runtime[PlannerDeps]：LangGraph 看到名为 runtime 的参数，会自动把运行时依赖注入进来
     # （只认参数名；类型注解只是给编辑器补全用的，写成 rt 就注入不进来）
-    def node(state: CollectState, runtime: Runtime[PlannerDeps]) -> dict[str, Any]:
+    async def node(state: CollectState, runtime: Runtime[PlannerDeps]) -> dict[str, Any]:
+        # get_stream_writer：拿到"自定义事件"的发送函数，发出去的事件会出现在 stream_mode="custom" 里
+        # 调用方没订阅 custom 时，writer 什么也不做，所以节点里可以放心地调用
+        
+        writer = get_stream_writer()
         builder = PlannerContextBuilder(runtime.context.amap)
         try:
-            result = func(builder, state["request"])
+            result = await func(builder, state["request"])
         except Exception as exc:
             # 和第 9 课一样：失败只记录在 tool_status 里，不影响其他工具
             logger.warning("工具 %s 失败: %s", name, exc)
+            writer({"type": "tool", "name": name, "ok": False})
             return {"tool_status": {name: {"ok": False, "error": str(exc)}}}
         
         count = len(next(iter(result.values())))
+        writer({"type": "tool", "name": name, "ok": True, "count": count})  # 前端可以显示"✅ 景点 12 个"
         return {"snapshot": result, "tool_status": {name: {"ok": True, "count": count}}}
     
     return node

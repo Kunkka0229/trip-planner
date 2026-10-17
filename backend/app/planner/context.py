@@ -4,6 +4,7 @@
   多 Agent：大模型决定调用什么工具 → 结果被总结成自然语言 → 工具出错也没人知道
   Context：代码决定调用什么工具（并行执行）→ 保留结构化数据 → 每个工具的成败都记在 tool_status 里
 """
+import asyncio
 import logging
 import math
 from concurrent.futures import ThreadPoolExecutor
@@ -39,40 +40,73 @@ def align_weather(request: TripRequest, forecasts: list[WeatherInfo]) -> list[di
             rows.append({"date": date, "day_weather": "暂无预报", "day_temp": "未知", "night_temp": "未知", "source": "unavailable"})
     return rows
 
+
+# ---------- P4：把"拿到数据之后怎么整理"抽成纯函数，同步和异步方法共用 ----------
+
+def attraction_rows(request: TripRequest, poi_lists: list[list[POIInfo]]) -> dict[str, Any]:
+    """poi_lists：每个偏好关键词各搜一次，得到多个列表"""
+    pois: dict[str, POIInfo] = {}
+    for poi_list in poi_lists:
+        for poi in poi_list:
+            pois.setdefault(poi.id, poi)  # setdefault：key 不存在才写入，实现按 id 去重并保留先出现的
+    rows = []
+    for poi in pois.values():
+        price, source = ticket_price_hint(poi, request)
+        rows.append(poi_row(poi, ticket_price_hint=price, price_source=source))
+    return {"attraction_pois": rows}
+
+def hotel_rows(request: TripRequest, pois: list[POIInfo]) -> dict[str, Any]:
+    rows = []
+    for poi in pois:
+        price, source = hotel_cost_hint(poi, request)
+        rows.append(poi_row(poi, estimated_cost_hint=price, price_source=source))
+    return {"hotel_pois": rows}
+
+def food_rows(pois: list[POIInfo]) -> dict[str, Any]:
+    rows = []
+    for poi in pois:
+        price, source = meal_cost_hint(poi)
+        rows.append(poi_row(poi, meal_cost_hint=price, price_source=source))
+    return {"food_pois": rows}
+
+def attraction_keywords(request: TripRequest) -> list[str]:
+    return request.preferences[:3] or ["景点"]
+
 class PlannerContextBuilder:
     def __init__(self, amap: AmapClient):
         self.amap = amap
         
-    # ---------- 每个工具一个方法，返回 {字段名: 数据} ----------
+    # ---------- 同步版：每个工具一个方法，返回 {字段名: 数据} ----------
     def collect_attractions(self, request: TripRequest) -> dict[str, Any]:
-        keywords = request.preferences[:3] or ["景点"]
-        pois: dict[str, POIInfo] = {}
-        for keyword in keywords:
-            for poi in self.amap.search_poi(keyword, request.city, limit=10):
-                pois.setdefault(poi.id, poi)  # setdefault：key 不存在才写入，实现按 id 去重并保留先出现的
-        
-        rows = []
-        for poi in pois.values():
-            price, source = ticket_price_hint(poi, request)  # 查表要知道城市和出发日期，所以多传一个 request
-            rows.append(poi_row(poi, ticket_price_hint=price, price_source=source))
-        return {"attraction_pois": rows}
+        lists = [self.amap.search_poi(kw, request.city, limit=10) for kw in attraction_keywords(request)]
+        return attraction_rows(request, lists)
     
     def collect_hotels(self, request: TripRequest) -> dict[str, Any]:
-        rows = []
-        for poi in self.amap.search_poi(request.accommodation, request.city, limit=8):
-            price, source = hotel_cost_hint(poi, request)
-            rows.append(poi_row(poi, estimated_cost_hint=price, price_source=source))
-        return {"hotel_pois": rows}
+        return hotel_rows(request, self.amap.search_poi(request.accommodation, request.city, limit=8))
     
     def collect_foods(self, request: TripRequest) -> dict[str, Any]:
-        rows = []
-        for poi in self.amap.search_poi("美食", request.city, limit=20):
-            price, source = meal_cost_hint(poi)
-            rows.append(poi_row(poi, meal_cost_hint=price, price_source=source))
-        return {"food_pois": rows}
+        return food_rows(self.amap.search_poi("美食", request.city, limit=20))
     
     def collect_weather(self, request: TripRequest) -> dict[str, Any]:
         return {"trip_weather": align_weather(request, self.amap.get_weather(request.city))}
+
+    # ---------- 异步版（P4）：给 LangGraph 的异步节点用 ----------
+    async def acollect_attractions(self, request: TripRequest) -> dict[str, Any]:
+        # asyncio.gather：同时发出多个请求，等全部完成，相当于 Promise.all
+        # * 把列表展开成多个参数：gather(a, b, c)
+        lists = await asyncio.gather(
+            *(self.amap.asearch_poi(kw, request.city, limit=10) for kw in attraction_keywords(request))
+        )
+        return attraction_rows(request, list(lists))
+    
+    async def acollect_hotels(self, request: TripRequest) -> dict[str, Any]:
+        return hotel_rows(request, await self.amap.asearch_poi(request.accommodation, request.city, limit=8))
+
+    async def acollect_foods(self, request: TripRequest) -> dict[str, Any]:
+        return food_rows(await self.amap.asearch_poi("美食", request.city, limit=20))
+    
+    async def acollect_weather(self, request: TripRequest) -> dict[str, Any]:
+        return {"trip_weather": align_weather(request, await self.amap.aget_weather(request.city))}
 
     # ---------- 并行执行所有工具 ----------
     def collect(self, request: TripRequest) -> dict[str, Any]:

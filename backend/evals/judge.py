@@ -69,12 +69,13 @@ def plan_digest(plan: TripPlan) -> list[dict]:
     ]
 
 
-def judge_plan(llm: BaseChatModel, request: TripRequest, plan: TripPlan) -> JudgeScore:
+async def judge_plan(llm: BaseChatModel, request: TripRequest, plan: TripPlan) -> JudgeScore:
     user = (
         f"【用户需求】\n{request.model_dump_json(exclude={'start_date', 'end_date'})}\n\n"
         f"【行程】\n{json.dumps(plan_digest(plan), ensure_ascii=False)}"
     )
-    text = llm.invoke([SystemMessage(JUDGE_SYSTEM_PROMPT), HumanMessage(user)], temperature=0).text
+    response = await llm.ainvoke([SystemMessage(JUDGE_SYSTEM_PROMPT), HumanMessage(user)], temperature=0)
+    text = response.text
     # 评委的输出同样是"不可信输入"，复用第 7 课的思路：抠出 JSON 再用 Pydantic 校验
     start, end = text.find("{"), text.rfind("}")
     return JudgeScore.model_validate_json(text[start : end + 1])

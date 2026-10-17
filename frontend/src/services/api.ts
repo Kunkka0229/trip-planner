@@ -102,24 +102,59 @@ export async function generateTripPlan(request: TripRequest): Promise<TripPlanRe
 // 第 11 课：SSE 流式接口，接收后端推送的真实进度
 // ============================================================
 
+/**
+ * P4：大模型边生成边推送的"草稿日"，还没经过后端校验，字段可能缺失，所以全部是可选的
+ * 只用来在加载页预览，最终展示以 result 事件里的正式数据为准
+ */
+export interface DraftDay {
+  date?: string
+  description?: string
+  hotel?: { name?: string } | null
+  attractions?: { name?: string; visit_duration?: number }[]
+  meals?: { type?: string; name?: string }[]
+}
+
+/** P4：collect 子图里每个高德工具跑完时推送一条（name: attractions / hotels / foods / weather） */
+export interface ToolEvent {
+  name: string
+  ok: boolean
+  count?: number
+}
+
 type StreamEvent =
   | { type: 'progress'; stage: string; percent: number }
+  | ({ type: 'tool' } & ToolEvent)
+  | { type: 'day'; index: number; day: DraftDay }
+  | { type: 'reset' }
   | { type: 'result'; data: TripPlanResponse }
   | { type: 'error'; message: string }
+
+/** P4：事件不止"进度"一种了，按类型分别回调；不关心的事件可以不传 */
+export interface StreamHandlers {
+  onProgress?: (stage: string, percent: number) => void
+  onTool?: (tool: ToolEvent) => void
+  onDay?: (index: number, day: DraftDay) => void
+  onReset?: () => void
+}
 
 /**
  * 为什么不用浏览器自带的 EventSource？它只支持 GET 请求，而我们要 POST 一个请求体
  * 所以用 fetch 拿到响应流，自己按 SSE 格式解析：每条消息是 "data: {...}\n\n"
+ *
+ * P4：signal 来自 AbortController。调用 controller.abort() 会中断 fetch，
+ * 后端发现连接断开后会取消规划任务，大模型停止生成，不再继续花钱
  */
 export async function generateTripPlanStream(
   request: TripRequest,
-  onProgress: (stage: string, percent: number) => void,
+  handlers: StreamHandlers = {},
+  signal?: AbortSignal,
 ): Promise<TripPlanResult> {
   const response = await fetch(`${baseURL}/api/trip/plan/stream`, {
     method: 'POST',
     // fetch 不经过 axios，请求头要自己带上
     headers: { 'Content-Type': 'application/json', 'X-User-Id': userId },
     body: JSON.stringify(request),
+    signal,
   })
   // 响应头在开始推送事件之前就到了，先取出 request_id，后面任何一步出错都能带上它
   const requestId = response.headers.get('X-Request-ID')
@@ -141,16 +176,29 @@ export async function generateTripPlanStream(
     buffer = parts.pop() ?? ''
 
     for (const part of parts) {
+      // P4：": ping" 心跳行（SSE 注释）不以 "data: " 开头，在这里被跳过
       if (!part.startsWith('data: ')) continue
       const event = JSON.parse(part.slice('data: '.length)) as StreamEvent
-      if (event.type === 'progress') {
-        onProgress(event.stage, event.percent)
-      } else if (event.type === 'error') {
-        throw new Error(withRequestId(event.message, requestId))
-      } else if (event.data.success && event.data.data) {
-        return { plan: event.data.data, message: event.data.message, traceId: event.data.trace_id }
-      } else {
-        throw new Error(withRequestId(event.data.message || '生成失败', requestId))
+      switch (event.type) {
+        case 'progress':
+          handlers.onProgress?.(event.stage, event.percent)
+          break
+        case 'tool':
+          handlers.onTool?.({ name: event.name, ok: event.ok, count: event.count })
+          break
+        case 'day':
+          handlers.onDay?.(event.index, event.day)
+          break
+        case 'reset':
+          handlers.onReset?.()
+          break
+        case 'error':
+          throw new Error(withRequestId(event.message, requestId))
+        case 'result':
+          if (event.data.success && event.data.data) {
+            return { plan: event.data.data, message: event.data.message, traceId: event.data.trace_id }
+          }
+          throw new Error(withRequestId(event.data.message || '生成失败', requestId))
       }
     }
   }

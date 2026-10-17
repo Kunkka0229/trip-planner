@@ -29,6 +29,10 @@ def get_llm() -> ChatOpenAI:
         # SDK 自带的重试：遇到 429 限流、5xx、网络抖动时自动重发（默认 2 次）
         # 设成 1：第 7 课我们会自己写"格式不合格就重试"的循环，两层重试叠加，最坏情况会等很久
         max_retries=1,
+        # P4：流式调用时也返回 token 用量（请求里带上 stream_options.include_usage）
+        # 只有官方 OpenAI 地址才默认开启；百炼、DeepSeek 等自定义 base_url 默认是关的，
+        # 不开的话，改成流式之后 Langfuse 的成本、评测的 token 统计都会变成 0
+        stream_usage=True,
     )
     logger.info("LLM 初始化成功: model=%s, base_url=%s", llm.model_name, settings.llm_base_url)
     return llm

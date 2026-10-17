@@ -10,12 +10,12 @@
 """
 
 import argparse
+import asyncio
 import json
 import os
 import statistics
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any
 
@@ -46,10 +46,11 @@ def make_llm(model: str | None, base_url: str | None, api_key_env: str | None) -
         api_key=os.environ[api_key_env] if api_key_env else settings.llm_api_key,
         timeout=settings.llm_timeout,
         max_retries=1,
+        stream_usage=True,  # P4：流式调用时也返回 token 用量，否则成本统计全是 0
     )
 
 
-def run_case(case: dict[str, Any], llm: BaseChatModel, judge_llm: BaseChatModel | None, variant: str) -> dict[str, Any]:
+async def run_case(case: dict[str, Any], llm: BaseChatModel, judge_llm: BaseChatModel | None, variant: str) -> dict[str, Any]:
     """跑一个用例，返回一行结果"""
     request, context = case["request"], load_context(case["id"])
     if context is None:
@@ -61,7 +62,7 @@ def run_case(case: dict[str, Any], llm: BaseChatModel, judge_llm: BaseChatModel 
         # 统计这个 with 块里所有模型调用的 token 用量（按模型名分别累计）
         get_usage_metadata_callback() as usage_cb,
     ):
-        final = trip_graph.invoke(
+        final = await trip_graph.ainvoke(
             {"request": request, "context": context},  # 带上冻结的 context，图会跳过 collect（P3 加的 route_start）
             config={"callbacks": [usage_cb, *langchain_callbacks()], "recursion_limit": 20},
             context=PlannerDeps(amap=None, llm=llm),  # 不会调用高德，所以 amap 传 None
@@ -73,7 +74,7 @@ def run_case(case: dict[str, Any], llm: BaseChatModel, judge_llm: BaseChatModel 
     judge_reason = None
     if judge_llm is not None and out.source == "llm":
         try:
-            verdict = judge_plan(judge_llm, request, out.plan)
+            verdict = await judge_plan(judge_llm, request, out.plan)
             scores |= verdict.normalized()  # |= 把评委的分数合并进来
             judge_reason = verdict.reason
         except Exception as exc:  # 评委自己也可能失败，不能因此丢掉整条结果
@@ -102,6 +103,19 @@ def run_case(case: dict[str, Any], llm: BaseChatModel, judge_llm: BaseChatModel 
     mark = "✅" if out.source == "llm" else "❌"
     print(f"{mark} {case['id']:<20} {latency:6.1f}s  尝试 {out.attempts} 次", flush=True)
     return row
+
+
+async def run_all(cases: list[dict[str, Any]], llm: BaseChatModel, judge_llm: BaseChatModel | None,
+                  variant: str, workers: int) -> list[dict[str, Any]]:
+    """P4：用 asyncio 并发跑用例（取代线程池）。Semaphore 限制同时在跑的用例数，避免被模型供应商限流"""
+    semaphore = asyncio.Semaphore(workers)
+
+    async def limited(case: dict[str, Any]) -> dict[str, Any]:
+        async with semaphore:  # 同一时刻最多 workers 个用例拿到"通行证"，其余的在这里排队
+            return await run_case(case, llm, judge_llm, variant)
+
+    # gather 按传入的顺序返回结果，相当于 Promise.all(cases.map(limited))
+    return list(await asyncio.gather(*(limited(c) for c in cases)))
 
 
 def percentile(values: list[float], p: float) -> float:
@@ -157,9 +171,8 @@ def main() -> None:
         judge_llm = make_llm(args.judge_model, args.judge_base_url, args.judge_api_key_env) if args.judge_model else llm
 
     print(f"🧪 评测 {args.variant}：{len(cases)} 个用例，并发 {args.workers}")
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        # pool.map 保持原来的顺序返回结果，相当于 Promise.all(cases.map(...))
-        rows = list(pool.map(lambda c: run_case(c, llm, judge_llm, args.variant), cases))
+    # asyncio.run 整个程序只调用一次：所有用例共用一个事件循环
+    rows = asyncio.run(run_all(cases, llm, judge_llm, args.variant, args.workers))
 
     RESULTS_DIR.mkdir(exist_ok=True)
     out_path = RESULTS_DIR / f"{args.variant}_{datetime.now():%Y%m%d-%H%M%S}.jsonl"

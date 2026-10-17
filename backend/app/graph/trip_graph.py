@@ -13,6 +13,8 @@ import logging
 from typing import Any, Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.utils.json import parse_partial_json
+from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
 
@@ -32,24 +34,61 @@ def error_reason(exc: Exception) -> str:
     return f"{type(exc).__name__}: {str(exc).splitlines()[0]}"
 
 # ---------- 节点：每个节点接收 state，返回"要更新的字段" ----------
-def generate(state: TripState, runtime: Runtime[PlannerDeps]) -> dict[str, Any]:
-    """调用一次大模型，只负责拿到原始输出，不做校验"""
+def finished_days(text: str) -> list[dict[str, Any]]:
+    """P4：从还没生成完的 JSON 里，解析出已经"写完"的那几天
+
+    parse_partial_json 能解析不完整的 JSON（自动补齐缺失的括号和引号），例如
+        '{"days": [{"date": "a"}, {"date": "b", "mea'  →  {"days": [{"date": "a"}, {"date": "b"}]}
+    最后一天可能还没写完，所以只返回"后面已经开始写下一天"的那些天
+    """
+    start = text.find("{")
+    if start == -1:
+        return []
+    try:
+        data = parse_partial_json(text[start:])
+    except Exception:  # 前面有不规范的内容，暂时解析不了，等更多内容到达再试
+        return []
+    days = data.get("days") if isinstance(data, dict) else None
+    return days[:-1] if isinstance(days, list) else []
+
+async def generate(state: TripState, runtime: Runtime[PlannerDeps]) -> dict[str, Any]:
+    """调用一次大模型，只负责拿到原始输出，不做校验
+
+    P4：改成流式调用。模型每吐出一段文字就检查一次，有一天写完了，就立刻把这一天推给前端
+    用户在 30 秒的等待里能看到行程一天一天地"长出来"，而不是盯着进度条
+    """
+    
+    writer = get_stream_writer()
     attempt = state.get("attempts", 0) + 1
     context_json = json.dumps(compact_for_prompt(state["context"]), ensure_ascii=False, separators=(",", ":"))
     prompt = build_context_prompt(context_json, state["request"].travel_days)
     if errors := state.get("errors"):
         prompt += f"\n\n注意：上一次的输出不合格，原因是：{errors[-1]}。请修正后重新输出完整 JSON。"
-
+        writer({"type": "reset"})  # 重试：让前端清掉上一次的草稿
+    
+    writer({"type": "progress", "stage": "正在生成行程" if attempt == 1 else f"正在重新生成（第 {attempt} 次）",
+            "percent": 40 + 10 * (attempt - 1)})
     temperature = BASE_TEMPERATURE + 0.1 * (attempt - 1)
+    messages = [SystemMessage(PLANNER_SYSTEM_PROMPT), HumanMessage(prompt)]
+    parts: list[str] = []
+    sent = 0  # 已经推送了几天
+    
     try:
-        draft = runtime.context.llm.invoke(
-            [SystemMessage(PLANNER_SYSTEM_PROMPT), HumanMessage(prompt)], temperature=temperature
-        ).text
+        # astream：异步流式调用，每次产出一小段（chunk），相当于前端用 fetch 读 ReadableStream
+        async for chunk in runtime.context.llm.astream(messages, temperature=temperature):
+            parts.append(chunk.text)
+            if "}" not in chunk.text:  # 只有出现右括号时，才可能有一天刚写完，省掉大部分解析
+                continue
+            
+            days = finished_days("".join(parts))
+            for index in range(sent, len(days)):
+                writer({"type": "day", "index": index, "day": days[index]})
+            sent = max(sent, len(days))
     except Exception as exc:  # 超时、网络错误：记一次失败，draft 置空
         logger.warning("第 %d/%d 次调用失败: %s", attempt, MAX_ATTEMPTS, error_reason(exc))
         return {"attempts": attempt, "draft": "", "errors": [error_reason(exc)]}
     
-    return {"attempts": attempt, "draft": draft}
+    return {"attempts": attempt, "draft": "".join(parts)}
 
 def validate(state: TripState) -> dict[str, Any]:
     """校验 + grounding + 天气覆盖 + 预算重算（原来 context_planner 里 postprocess 闭包做的事）"""
