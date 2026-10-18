@@ -14,6 +14,8 @@ from app.services.amap_client import AmapError
 from app.config import get_settings
 from app.observability.logs import setup_logging, request_id_var
 from app.observability.tracing import shutdown_tracing
+from app.graph.checkpoint import open_checkpointer
+from app.graph.trip_graph import build_trip_graph
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +38,12 @@ async def lifespan(app: FastAPI):
     logger.info("%s v%s 启动，监听地址 %s:%s", settings.app_name, settings.app_version, settings.host, settings.port)
     logger.info("高德 Key: %s，LLM Key: %s", status_of(settings.amap_api_key), status_of(settings.llm_api_key))
     logger.info("CORS 允许: %s", settings.cors_origins_list)
-    yield  # ← 服务在这里运行，直到收到关闭信号
+
+    # P5：打开 checkpointer，编译带持久化的图，挂到 app.state 上（app.state 是 FastAPI 提供的"全局存储"）
+    # 用 async with 包住 yield：服务运行期间连接一直打开，服务关闭时自动关闭
+    async with open_checkpointer(settings.checkpoint_url) as checkpointer:
+        app.state.trip_graph = build_trip_graph(checkpointer=checkpointer)
+        yield  # ← 服务在这里运行，直到收到关闭信号
     shutdown_tracing()  # P2：把还没上报的 trace 发完再退出
     logger.info("服务已关闭")
     

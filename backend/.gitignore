@@ -7,3 +7,4 @@
 # Python 运行时生成的字节码缓存
 __pycache__/
 *.pyc
+data/

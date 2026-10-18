@@ -38,3 +38,10 @@ export type Budget = Resp<'Budget'>
 export type TripPlan = Resp<'TripPlan'>
 export type TripPlanResponse = Resp<'TripPlanResponse'>
 export type POIInfo = Resp<'POIInfo'>
+
+// ============ P5：会话（多轮修改） ============
+
+export type ChatRequest = Schemas['ChatRequest']
+export type ChatMessage = Resp<'ChatMessage'>
+// GET /api/trip/{thread_id}、POST /api/trip/{thread_id}/undo 的返回：行程 + 对话记录
+export type TripSession = Resp<'TripSession'>

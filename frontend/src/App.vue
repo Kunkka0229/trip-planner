@@ -2,8 +2,11 @@
 import zhCN from 'ant-design-vue/es/locale/zh_CN' // antd 组件的中文文案
 import dayjs from 'dayjs'
 import 'dayjs/locale/zh-cn' // 日期选择器里的星期、月份文字
+import { useRoute } from 'vue-router'
 
 dayjs.locale('zh-cn')
+
+const route = useRoute()
 </script>
 
 <template>
@@ -11,7 +14,8 @@ dayjs.locale('zh-cn')
   <a-config-provider :locale="zhCN">
     <a-layout class="app-layout">
       <a-layout-header class="app-header">HelloAgents 智能旅行助手</a-layout-header>
-      <a-layout-content class="app-content">
+      <!-- P5：结果页（meta.wide）多了对话面板，内容区放宽 -->
+      <a-layout-content :class="['app-content', { 'app-content-wide': route.meta.wide }]">
         <router-view />
       </a-layout-content>
     </a-layout>
@@ -38,5 +42,9 @@ dayjs.locale('zh-cn')
   width: 100%;
   margin: 0 auto;
   padding: 24px 16px;
+}
+
+.app-content-wide {
+  max-width: 1280px;
 }
 </style>

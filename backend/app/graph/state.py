@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from typing import Annotated, Any, Literal, TypedDict
 
 from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AnyMessage
+from langgraph.graph.message import add_messages
 
 from app.models.schemas import TripPlan, TripRequest
 from app.services.amap_client import AmapClient
@@ -21,6 +23,10 @@ class TripState(TypedDict, total=False):
     warnings: list[str]
     plan: TripPlan  # 校验通过（或兜底）的最终行程
     source: Literal["llm", "fallback"]
+    # ---------- P5：多轮对话 ----------
+    # add_messages：LangGraph 自带的消息 reducer。新消息追加到末尾；id 相同的消息会被替换（而不是重复追加）
+    messages: Annotated[list[AnyMessage], add_messages]
+    user_id: str  # 这个会话属于谁，防止别人拿着 thread_id 偷看或修改
     
 @dataclass
 class PlannerDeps:

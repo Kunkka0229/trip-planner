@@ -223,6 +223,7 @@ class TripPlanResponse(BaseModel):
     message: str = ""
     data: TripPlan | None = None  # 失败时 data 为 null
     trace_id: str | None = None  # P2：这次生成对应的 Langfuse trace，前端提交反馈时带回来
+    thread_id: str | None = None  # P5：会话 ID，之后修改、撤销、刷新页面都靠它
 
 # ============================================================
 # 高德相关模型（第 5 课新增）
@@ -254,3 +255,19 @@ class FeedbackRequest(BaseModel):
     trace_id: str = Field(..., min_length=32, max_length=32, description="生成行程时返回的 trace_id")
     helpful: bool = Field(..., description="这份行程有没有帮助（👍 / 👎）")
     comment: str = Field(default="", max_length=500, description="可选的文字反馈")
+
+# ============================================================
+# 多轮修改（P5 新增）
+# ============================================================
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=500, description="用户的修改要求，例如：第二天太累了，少安排一个景点")
+
+class ChatMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+class TripSession(BaseModel):
+    """GET /api/trip/{thread_id} 的返回：刷新页面后恢复会话用"""
+    thread_id: str
+    plan: TripPlan
+    messages: list[ChatMessage]

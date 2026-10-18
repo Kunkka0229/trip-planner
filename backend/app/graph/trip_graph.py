@@ -12,11 +12,15 @@ import json
 import logging
 from typing import Any, Literal
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage
 from langchain_core.utils.json import parse_partial_json
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
+
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 from app.agents.generation import BASE_TEMPERATURE, MAX_ATTEMPTS, build_fallback
 from app.agents.output import parse_and_check, recompute_budget
@@ -26,6 +30,7 @@ from app.graph.state import PlannerDeps, TripState
 from app.models.schemas import WeatherInfo
 from app.planner.context import compact_for_prompt
 from app.planner.grounding import ground_plan
+from app.graph.edit_agent import build_edit_agent
 
 logger = logging.getLogger(__name__)  # __name__ 是模块名，例如 app.graph.trip_graph，日志里会显示出来
 
@@ -117,10 +122,24 @@ def fallback(state: TripState) -> dict[str, Any]:
     logger.error("大模型多次生成失败，返回兜底方案")
     return {"plan": build_fallback(request, "大模型多次生成失败"), "source": "fallback"}
 
+async def assistant(state: TripState, runtime: Runtime[PlannerDeps]) -> dict[str, Any]:
+    """P5：多轮修改。把对话和行程交给修改 Agent，拿回新的对话和新的行程"""
+    agent = build_edit_agent(runtime.context.llm)
+    # 在节点里调用另一张图：config（回调、checkpointer）会自动传下去，trace 里它显示为 assistant 的子节点
+    result = await agent.ainvoke({key: state[key] for key in ("messages", "plan", "context", "request")})
+    # 修改 Agent 可能把较早的消息压缩成了摘要（SummarizationMiddleware），
+    # 所以先清空主图里的消息，再整体换成 Agent 返回的版本，两边保持一致
+    return {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *result["messages"]], "plan": result["plan"]}
+
 # ---------- 路由函数：读 state，返回下一个节点的名字 ----------
 # 返回值类型写成 Literal：LangGraph 会据此知道"可能去哪些节点"，画图时能画出所有分支
-def route_start(state: TripState) -> Literal["collect", "generate", "fallback"]:
-    """P3：调用方已经带了 context（评测时用冻结的 context）就跳过 collect，直接进入后面的流程"""
+def route_start(state: TripState) -> Literal["collect", "generate", "fallback", "assistant"]:
+    """入口路由
+    P5：这个会话已经有行程了，用户又发来一条消息 → 交给修改 Agent
+    P3：调用方已经带了 context（评测时用冻结的 context）→ 跳过 collect
+    """
+    if state.get("plan") is not None and state.get("messages"):
+        return "assistant"
     return route_after_collect(state) if state.get("context") else "collect"
 
 def route_after_collect(state: TripState) -> Literal["generate", "fallback"]:
@@ -137,13 +156,16 @@ def route_after_validate(state: TripState) -> Literal["generate", "fallback", "_
     # "__end__" 就是 END 常量的值；plan 存在说明校验通过
     return END if state.get("plan") else retry_or_give_up(state)
 
-def build_trip_graph():
+def build_trip_graph(checkpointer: BaseCheckpointSaver | None = None):
+    """checkpointer（P5）：传入后，每执行完一步都会把 state 存下来，同一个 thread_id 的下一次调用能接着上次的 state 继续"""
+
     builder = StateGraph(TripState, context_schema=PlannerDeps)
     # 编译好的子图可以直接当成一个节点：主图只看到它的输入（request）和输出（context）
     builder.add_node("collect", build_collect_graph())
     builder.add_node("generate", generate)
     builder.add_node("validate", validate)
     builder.add_node("fallback", fallback)
+    builder.add_node("assistant", assistant)
 
     # P3：入口也可以是条件边。正常请求走 collect；评测时传入冻结的 context，直接去 generate
     builder.add_conditional_edges(START, route_start)
@@ -153,7 +175,8 @@ def build_trip_graph():
     builder.add_conditional_edges("generate", route_after_generate)
     builder.add_conditional_edges("validate", route_after_validate)
     builder.add_edge("fallback", END)
-    return builder.compile()
+    builder.add_edge("assistant", END)
+    return builder.compile(checkpointer=checkpointer)
 
 # 图的结构是固定的，模块加载时编译一次，所有请求共用（依赖通过 context 每次传入）
 trip_graph = build_trip_graph()

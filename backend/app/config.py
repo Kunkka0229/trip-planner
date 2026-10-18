@@ -74,6 +74,9 @@ class Settings(BaseSettings):
     langfuse_secret_key: str = ""
     langfuse_base_url: str = "http://localhost:3000"
     
+    # ---------- 会话持久化（P5）----------
+    checkpoint_url: str = "sqlite:///data/checkpoints.db"  # 写法见 app/graph/checkpoint.py
+    
     # @property：把方法变成"只读属性"，调用时不用加括号：settings.cors_origins_list
     # 类似 JS class 里的 get corsOriginsList() { ... }
     @property

@@ -125,13 +125,16 @@ async function handleSubmit() {
     } else {
       sessionStorage.removeItem('tripTraceId')
     }
+    // P5：记下这条提示属于哪个会话，结果页只在同一个会话里显示它
+    sessionStorage.setItem('tripMessageThread', result.threadId ?? '')
     // 后端返回的是兜底方案（第 7 课），或者带有警告（第 9 课）时，用黄色提示
     if (result.message.includes('基础行程') || result.message.includes('注意')) {
       message.warning(result.message, 6)
     } else {
       message.success('行程生成成功')
     }
-    router.push({ name: 'result' })
+    // P5：带上 thread_id 跳转，结果页从后端恢复数据；mock 数据没有 thread_id，结果页退回读 sessionStorage
+    router.push({ name: 'result', params: result.threadId ? { threadId: result.threadId } : {} })
   } catch (error) {
     // 用户主动取消时 fetch 抛 AbortError，不算错误
     if ((error as Error).name === 'AbortError') {

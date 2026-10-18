@@ -81,8 +81,66 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** 生成旅行计划（SSE 推送进度） */
+        /** 生成旅行计划（SSE 推送进度和逐天草稿） */
         post: operations["plan_trip_stream_api_trip_plan_stream_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/trip/{thread_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 获取会话（刷新页面后恢复） */
+        get: operations["get_session_api_trip__thread_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/trip/{thread_id}/chat": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 用自然语言修改行程（SSE） */
+        post: operations["chat_api_trip__thread_id__chat_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/trip/{thread_id}/undo": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 撤销上一次修改
+         * @description 时间旅行（time travel）：checkpointer 保存了每一步的 state，沿着"父 checkpoint"往回找，
+         *     找到行程和现在不一样的、上一轮对话结束时的那个 state，从那里"分叉"出一个新的 checkpoint
+         *
+         *     为什么不直接把旧行程写回去？因为对话记录也要一起回到那个时刻，否则模型会看到"我改过了"的对话，
+         *     却面对着没改过的行程，下一轮对话就乱了
+         */
+        post: operations["undo_api_trip__thread_id__undo_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -303,6 +361,24 @@ export interface components {
              * @enum {string}
              */
             strictness: "hard" | "soft" | "none";
+        };
+        /** ChatMessage */
+        ChatMessage: {
+            /**
+             * Role
+             * @enum {string}
+             */
+            role: "user" | "assistant";
+            /** Content */
+            content: string;
+        };
+        /** ChatRequest */
+        ChatRequest: {
+            /**
+             * Message
+             * @description 用户的修改要求，例如：第二天太累了，少安排一个景点
+             */
+            message: string;
         };
         /**
          * DayPlan
@@ -545,6 +621,8 @@ export interface components {
             data?: components["schemas"]["TripPlan"] | null;
             /** Trace Id */
             trace_id?: string | null;
+            /** Thread Id */
+            thread_id?: string | null;
         };
         /**
          * TripRequest
@@ -620,6 +698,17 @@ export interface components {
             free_text_input: string;
             party: components["schemas"]["PartyInfo"];
             budget_constraint?: components["schemas"]["BudgetConstraint"];
+        };
+        /**
+         * TripSession
+         * @description GET /api/trip/{thread_id} 的返回：刷新页面后恢复会话用
+         */
+        TripSession: {
+            /** Thread Id */
+            thread_id: string;
+            plan: components["schemas"]["TripPlan"];
+            /** Messages */
+            messages: components["schemas"]["ChatMessage"][];
         };
         /** ValidationError */
         ValidationError: {
@@ -813,6 +902,109 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_session_api_trip__thread_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-User-Id"?: string;
+            };
+            path: {
+                thread_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TripSession"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    chat_api_trip__thread_id__chat_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-User-Id"?: string;
+            };
+            path: {
+                thread_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChatRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    undo_api_trip__thread_id__undo_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-User-Id"?: string;
+            };
+            path: {
+                thread_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TripSession"];
                 };
             };
             /** @description Validation Error */

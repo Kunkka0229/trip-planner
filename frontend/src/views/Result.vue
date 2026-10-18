@@ -1,14 +1,17 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
-import { useRouter } from 'vue-router'
-import { message } from 'ant-design-vue'
+import { computed, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { Grid, message } from 'ant-design-vue'
+import ChatPanel from '@/components/ChatPanel.vue'
 import TripMap from '@/components/TripMap.vue'
-import { submitFeedback } from '@/services/api'
+import { useTripChat } from '@/composables/useTripChat'
+import { getSession, submitFeedback } from '@/services/api'
 import type { TripPlan, TripRequest, WeatherInfo } from '@/types'
 import { recomputeBudget } from '@/utils/budget'
 import { exportAsImage, exportAsPdf } from '@/utils/export'
 
 const router = useRouter()
+const route = useRoute()
 
 // ---------- 读取首页存进来的数据 ----------
 // 泛型函数：读取并解析 JSON，失败返回 null
@@ -21,11 +24,73 @@ function load<T>(key: string): T | null {
   }
 }
 
-const plan = ref<TripPlan | null>(load<TripPlan>('tripPlan'))
+// P5：路由参数里的 thread_id（/result/:threadId?）。params 的类型是 string | string[]，只认字符串
+const threadId = computed(() => (typeof route.params.threadId === 'string' ? route.params.threadId : undefined))
+
+const plan = ref<TripPlan | null>(null)
+const loading = ref(false)
+const loadError = ref('') // 会话不存在、不是自己的（都是 404）、网络错误……
+
+// 请求只在首页提交时存过一份；换设备打开时没有，人数、预算上限就不显示
 const request = load<TripRequest>('tripRequest')
-const notice = sessionStorage.getItem('tripMessage') ?? ''
+// 首页的提示（兜底、grounding 警告）只属于刚生成的那个会话，打开别的会话时不显示
+const notice = computed(() =>
+  (sessionStorage.getItem('tripMessageThread') ?? '') === (threadId.value ?? '')
+    ? (sessionStorage.getItem('tripMessage') ?? '')
+    : '',
+)
 // 总人数：前端没有 computed_field，自己加一下
 const people = request ? request.party.adults + request.party.children + request.party.infants : 1
+
+// ---------- P5：对话修改 ----------
+const highlightDays = ref(new Set<number>()) // 刚被修改的天，卡片高亮闪一下
+
+/** 对话或撤销返回了新行程：找出哪几天变了，替换数据，高亮并滚动到第一处变化 */
+function applyPlan(next: TripPlan) {
+  const prev = plan.value
+  const changed = next.days
+    .map((_, i) => i)
+    .filter((i) => JSON.stringify(next.days[i]) !== JSON.stringify(prev?.days[i]))
+  plan.value = next
+  highlightDays.value = new Set(changed)
+  setTimeout(() => (highlightDays.value = new Set()), 2000) // 和 CSS 动画时长一致
+  if (changed.length) {
+    document.getElementById(`day-${next.days[changed[0]].day_index}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
+}
+
+const chat = useTripChat(threadId, applyPlan)
+
+// 宽屏（md 及以上）对话面板放在右侧；窄屏收进底部抽屉，点悬浮按钮打开
+const screens = Grid.useBreakpoint()
+const isWide = computed(() => !!screens.value.md)
+const drawerOpen = ref(false)
+
+// 进入页面、或者从一个会话跳到另一个会话时加载数据
+// 有 thread_id：从后端恢复行程和对话（刷新、换设备打开都能用，前提是同一个 X-User-Id）
+// 没有 thread_id：mock 数据，退回读 sessionStorage（和 P4 之前一样）
+watch(
+  threadId,
+  async (id) => {
+    loadError.value = ''
+    if (!id) {
+      plan.value = load<TripPlan>('tripPlan')
+      return
+    }
+    loading.value = true
+    try {
+      const session = await getSession(id)
+      plan.value = session.plan
+      chat.load(session)
+    } catch (e) {
+      plan.value = null
+      loadError.value = (e as Error).message
+    } finally {
+      loading.value = false
+    }
+  },
+  { immediate: true },
+)
 
 const mealLabels = { breakfast: '早餐', lunch: '午餐', dinner: '晚餐', snack: '小吃' } as const
 
@@ -169,24 +234,27 @@ function openDislike() {
 </script>
 
 <template>
-  <a-result v-if="!plan" status="warning" title="没有找到行程数据">
+  <div v-if="loading" class="page-loading"><a-spin tip="正在加载行程..." /></div>
+
+  <a-result v-else-if="!plan" status="warning" :title="loadError || '没有找到行程数据'">
     <template #extra>
       <a-button type="primary" @click="router.push({ name: 'home' })">返回首页</a-button>
     </template>
   </a-result>
 
   <a-row v-else :gutter="24">
-    <!-- 左侧导航：小屏幕隐藏（xs=0） -->
-    <a-col :xs="0" :md="5">
+    <!-- 左侧导航：小屏幕隐藏（xs=0）；有对话面板时只在很宽的屏幕（xl）显示，给行程和对话腾地方 -->
+    <a-col :xs="0" :md="threadId ? 0 : 5" :xl="threadId ? 4 : 5">
       <a-anchor :items="anchorItems" :offset-top="16" />
     </a-col>
 
-    <a-col :xs="24" :md="19">
+    <a-col :xs="24" :md="threadId ? 14 : 19" :xl="threadId ? 12 : 19">
       <!-- 工具栏：data-export-ignore 表示导出时忽略这部分 -->
       <a-space style="margin-bottom: 16px" wrap data-export-ignore>
         <a-button @click="router.push({ name: 'home' })">重新规划</a-button>
         <template v-if="!editing">
-          <a-button @click="startEdit">编辑行程</a-button>
+          <!-- P5：有会话时行程以后端为准，手动编辑只存在本地，下一次对话或撤销就会被覆盖，所以改用对话修改 -->
+          <a-button v-if="!threadId" @click="startEdit">编辑行程</a-button>
           <a-button :loading="exporting" @click="handleExport('image')">导出图片</a-button>
           <a-button :loading="exporting" @click="handleExport('pdf')">导出 PDF</a-button>
         </template>
@@ -200,7 +268,7 @@ function openDislike() {
         <!-- 概览 -->
         <a-card id="overview" class="section">
           <h2>{{ plan.city }} {{ plan.days.length }} 日游</h2>
-          <p>{{ plan.start_date }} 至 {{ plan.end_date }} · {{ people }} 人</p>
+          <p>{{ plan.start_date }} 至 {{ plan.end_date }}<template v-if="request"> · {{ people }} 人</template></p>
           <a-alert v-if="notice" :message="notice" type="info" show-icon style="margin-bottom: 12px" />
           <p>{{ plan.overall_suggestions }}</p>
 
@@ -265,7 +333,7 @@ function openDislike() {
           :id="`day-${day.day_index}`"
           :key="day.date"
           :title="`第 ${day.day_index + 1} 天 · ${day.date}`"
-          class="section"
+          :class="['section', { flash: highlightDays.has(dayIndex) }]"
         >
           <p>{{ day.description }}</p>
           <p v-if="day.hotel">🏨 {{ day.hotel.name }}（{{ day.hotel.estimated_cost }} 元/间/晚）</p>
@@ -290,7 +358,24 @@ function openDislike() {
         </a-card>
       </div>
     </a-col>
+
+    <!-- P5：右侧对话面板（宽屏）。sticky：滚动行程时面板固定在视口里 -->
+    <a-col v-if="threadId && isWide" :md="10" :xl="8">
+      <a-card class="chat-card" :body-style="{ height: '100%', padding: '16px' }">
+        <ChatPanel :chat="chat" />
+      </a-card>
+    </a-col>
   </a-row>
+
+  <!-- P5：窄屏时对话面板收进底部抽屉 -->
+  <template v-if="plan && threadId && !isWide">
+    <a-float-button type="primary" tooltip="对话修改行程" @click="drawerOpen = true">
+      <template #icon>💬</template>
+    </a-float-button>
+    <a-drawer v-model:open="drawerOpen" placement="bottom" height="75vh" :closable="false" :body-style="{ padding: '16px' }">
+      <ChatPanel :chat="chat" />
+    </a-drawer>
+  </template>
 
   <!-- P2：点 👎 时收集原因。原因可以不填，但填了对改进最有用 -->
   <a-modal
@@ -312,6 +397,35 @@ function openDislike() {
 </template>
 
 <style scoped>
+.page-loading {
+  display: flex;
+  justify-content: center;
+  padding: 80px 0;
+}
+
+.chat-card {
+  position: sticky;
+  top: 16px;
+  height: calc(100vh - 64px - 48px - 16px); /* 视口高度 - 顶栏 - 内容区上下内边距 - 留白 */
+}
+
+/* 被对话修改过的那一天：背景闪一下 */
+.flash {
+  animation: flash 2s ease-out;
+}
+
+@keyframes flash {
+  0%,
+  30% {
+    background: #e6f4ff;
+    box-shadow: 0 0 0 2px #91caff;
+  }
+  100% {
+    background: #fff;
+    box-shadow: none;
+  }
+}
+
 .section {
   margin-bottom: 16px;
   scroll-margin-top: 16px; /* 锚点跳转时顶部留出一点空间 */

@@ -1,5 +1,5 @@
 import axios, { AxiosError } from 'axios'
-import type { FeedbackRequest, TripPlan, TripPlanResponse, TripRequest } from '@/types'
+import type { ChatRequest, FeedbackRequest, TripPlan, TripPlanResponse, TripRequest, TripSession } from '@/types'
 
 // 读取 .env 里的 VITE_API_BASE_URL（只有 VITE_ 开头的变量才会暴露给前端代码）
 // 留空 → baseURL 为 ''，请求发到当前域名的 /api/...，由 Vite 代理转发
@@ -77,7 +77,8 @@ function toErrorMessage(error: unknown): string {
 // 响应拦截器：失败时统一转换错误信息，业务代码只需要 catch 后显示 error.message
 http.interceptors.response.use(
   (response) => response,
-  (error) => Promise.reject(new Error(toErrorMessage(error))),
+  // P5：把 HTTP 状态码也带上，调用方可以区分"没有可撤销的修改"（400）和其他错误
+  (error) => Promise.reject(Object.assign(new Error(toErrorMessage(error)), { status: error.response?.status })),
 )
 
 /** 生成结果：行程、后端的提示信息，以及这次生成对应的 trace_id（P2，没启用 Langfuse 时为 null） */
@@ -85,6 +86,7 @@ export interface TripPlanResult {
   plan: TripPlan
   message: string
   traceId: string | null
+  threadId: string | null // P5：会话 ID；没配置大模型（mock 数据）时为 null
 }
 
 /** 生成旅行计划：成功返回行程和后端的提示信息，失败抛出 Error */
@@ -95,7 +97,7 @@ export async function generateTripPlan(request: TripRequest): Promise<TripPlanRe
     throw new Error(data.message || '生成失败')
   }
   // 第 10 课：把 message 一起返回。兜底方案、grounding 警告都写在 message 里（第 7、9 课）
-  return { plan: data.data, message: data.message, traceId: data.trace_id }
+  return { plan: data.data, message: data.message, traceId: data.trace_id, threadId: data.thread_id }
 }
 
 // ============================================================
@@ -122,6 +124,7 @@ export interface ToolEvent {
 }
 
 type StreamEvent =
+  | { type: 'thread'; thread_id: string } // P5：第一个事件，告诉前端这次会话的 ID
   | { type: 'progress'; stage: string; percent: number }
   | ({ type: 'tool' } & ToolEvent)
   | { type: 'day'; index: number; day: DraftDay }
@@ -131,6 +134,7 @@ type StreamEvent =
 
 /** P4：事件不止"进度"一种了，按类型分别回调；不关心的事件可以不传 */
 export interface StreamHandlers {
+  onThread?: (threadId: string) => void
   onProgress?: (stage: string, percent: number) => void
   onTool?: (tool: ToolEvent) => void
   onDay?: (index: number, day: DraftDay) => void
@@ -138,68 +142,151 @@ export interface StreamHandlers {
 }
 
 /**
+ * 发起一个 SSE 请求，返回 request_id 和一个"事件迭代器"（P5：生成行程和对话修改共用）
+ *
  * 为什么不用浏览器自带的 EventSource？它只支持 GET 请求，而我们要 POST 一个请求体
  * 所以用 fetch 拿到响应流，自己按 SSE 格式解析：每条消息是 "data: {...}\n\n"
  *
  * P4：signal 来自 AbortController。调用 controller.abort() 会中断 fetch，
- * 后端发现连接断开后会取消规划任务，大模型停止生成，不再继续花钱
+ * 后端发现连接断开后会取消任务，大模型停止生成，不再继续花钱
  */
-export async function generateTripPlanStream(
-  request: TripRequest,
-  handlers: StreamHandlers = {},
-  signal?: AbortSignal,
-): Promise<TripPlanResult> {
-  const response = await fetch(`${baseURL}/api/trip/plan/stream`, {
+async function openSse<E>(path: string, body: unknown, signal?: AbortSignal) {
+  const response = await fetch(`${baseURL}${path}`, {
     method: 'POST',
     // fetch 不经过 axios，请求头要自己带上
     headers: { 'Content-Type': 'application/json', 'X-User-Id': userId },
-    body: JSON.stringify(request),
+    body: JSON.stringify(body),
     signal,
   })
   // 响应头在开始推送事件之前就到了，先取出 request_id，后面任何一步出错都能带上它
   const requestId = response.headers.get('X-Request-ID')
   if (!response.ok || !response.body) {
-    throw new Error(withRequestId(`请求失败（HTTP ${response.status}）`, requestId))
+    // P5：404（会话不存在）、503（没配置大模型）在开始 SSE 之前就返回了，响应体是 { detail: "..." }
+    const detail = await response
+      .json()
+      .then((data: { detail?: unknown }) => (typeof data.detail === 'string' ? data.detail : ''))
+      .catch(() => '')
+    throw new Error(withRequestId(detail || `请求失败（HTTP ${response.status}）`, requestId))
   }
-
   const reader = response.body.getReader()
-  const decoder = new TextDecoder() // 把字节流解码成字符串（中文是多字节字符，必须用 stream 模式解码）
-  let buffer = '' // 网络分块不保证正好按消息边界切开，没处理完的部分先存着
 
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-
-    // 按空行切分出完整的消息，最后一段可能不完整，留到下一轮再处理
-    const parts = buffer.split('\n\n')
-    buffer = parts.pop() ?? ''
-
-    for (const part of parts) {
-      // P4：": ping" 心跳行（SSE 注释）不以 "data: " 开头，在这里被跳过
-      if (!part.startsWith('data: ')) continue
-      const event = JSON.parse(part.slice('data: '.length)) as StreamEvent
-      switch (event.type) {
-        case 'progress':
-          handlers.onProgress?.(event.stage, event.percent)
-          break
-        case 'tool':
-          handlers.onTool?.({ name: event.name, ok: event.ok, count: event.count })
-          break
-        case 'day':
-          handlers.onDay?.(event.index, event.day)
-          break
-        case 'reset':
-          handlers.onReset?.()
-          break
-        case 'error':
-          throw new Error(withRequestId(event.message, requestId))
-        case 'result':
-          if (event.data.success && event.data.data) {
-            return { plan: event.data.data, message: event.data.message, traceId: event.data.trace_id }
-          }
-          throw new Error(withRequestId(event.data.message || '生成失败', requestId))
+  // async function*：异步生成器，调用方用 for await 逐个取事件（相当于一个"异步的数组"）
+  async function* events(): AsyncGenerator<E> {
+    const decoder = new TextDecoder() // 把字节流解码成字符串（中文是多字节字符，必须用 stream 模式解码）
+    let buffer = '' // 网络分块不保证正好按消息边界切开，没处理完的部分先存着
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) return
+      buffer += decoder.decode(value, { stream: true })
+      // 按空行切分出完整的消息，最后一段可能不完整，留到下一轮再处理
+      const parts = buffer.split('\n\n')
+      buffer = parts.pop() ?? ''
+      for (const part of parts) {
+        // P4：": ping" 心跳行（SSE 注释）不以 "data: " 开头，在这里被跳过
+        if (part.startsWith('data: ')) yield JSON.parse(part.slice('data: '.length)) as E
       }
+    }
+  }
+  return { requestId, events: events() }
+}
+
+export async function generateTripPlanStream(
+  request: TripRequest,
+  handlers: StreamHandlers = {},
+  signal?: AbortSignal,
+): Promise<TripPlanResult> {
+  const { requestId, events } = await openSse<StreamEvent>('/api/trip/plan/stream', request, signal)
+  for await (const event of events) {
+    switch (event.type) {
+      case 'thread':
+        handlers.onThread?.(event.thread_id)
+        break
+      case 'progress':
+        handlers.onProgress?.(event.stage, event.percent)
+        break
+      case 'tool':
+        handlers.onTool?.({ name: event.name, ok: event.ok, count: event.count })
+        break
+      case 'day':
+        handlers.onDay?.(event.index, event.day)
+        break
+      case 'reset':
+        handlers.onReset?.()
+        break
+      case 'error':
+        throw new Error(withRequestId(event.message, requestId))
+      case 'result':
+        if (event.data.success && event.data.data) {
+          return {
+            plan: event.data.data,
+            message: event.data.message,
+            traceId: event.data.trace_id,
+            threadId: event.data.thread_id,
+          }
+        }
+        throw new Error(withRequestId(event.data.message || '生成失败', requestId))
+    }
+  }
+  throw new Error(withRequestId('连接意外中断，没有收到结果', requestId))
+}
+
+// ============================================================
+// P5：会话：恢复、对话修改、撤销
+// ============================================================
+
+/** 按 thread_id 恢复行程和对话（刷新页面、换设备打开都靠它）。不存在或不是自己的会话返回 404 */
+export async function getSession(threadId: string): Promise<TripSession> {
+  const { data } = await http.get<TripSession>(`/api/trip/${encodeURIComponent(threadId)}`)
+  return data
+}
+
+/** 撤销上一次修改，返回值和 getSession 一样。没有可以撤销的修改时后端返回 400 */
+export async function undoEdit(threadId: string): Promise<TripSession> {
+  const { data } = await http.post<TripSession>(`/api/trip/${encodeURIComponent(threadId)}/undo`)
+  return data
+}
+
+/** 撤销失败是不是因为"没有可以撤销的修改"（400）：这种情况前端只需要把按钮置灰 */
+export function isNothingToUndo(error: unknown): boolean {
+  return (error as Error & { status?: number }).status === 400
+}
+
+type ChatEvent =
+  | { type: 'token'; text: string }
+  | { type: 'tool_result'; name: string; content: string }
+  | { type: 'done'; reply: string; plan: TripPlan }
+  | { type: 'error'; message: string }
+
+export interface ChatHandlers {
+  onToken?: (text: string) => void // 助手回复的一小段文字，逐段追加到气泡里（打字机效果）
+  onToolResult?: (name: string, content: string) => void // 工具执行结果，例如"已把第 2 天的……"
+}
+
+/** 用自然语言修改行程（SSE）。返回助手的完整回复和修改后的行程 */
+export async function chatStream(
+  threadId: string,
+  message: string,
+  handlers: ChatHandlers = {},
+  signal?: AbortSignal,
+): Promise<{ reply: string; plan: TripPlan }> {
+  const body: ChatRequest = { message }
+  const { requestId, events } = await openSse<ChatEvent>(
+    `/api/trip/${encodeURIComponent(threadId)}/chat`,
+    body,
+    signal,
+  )
+  for await (const event of events) {
+    switch (event.type) {
+      case 'token':
+        handlers.onToken?.(event.text)
+        break
+      case 'tool_result':
+        handlers.onToolResult?.(event.name, event.content)
+        break
+      case 'error':
+        throw new Error(withRequestId(event.message, requestId))
+      case 'done':
+        return { reply: event.reply, plan: event.plan }
     }
   }
   throw new Error(withRequestId('连接意外中断，没有收到结果', requestId))
