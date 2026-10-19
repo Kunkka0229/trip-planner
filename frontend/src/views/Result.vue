@@ -3,6 +3,7 @@ import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { Grid, message } from 'ant-design-vue'
 import ChatPanel from '@/components/ChatPanel.vue'
+import ConfirmModal from '@/components/ConfirmModal.vue'
 import TripMap from '@/components/TripMap.vue'
 import { useTripChat } from '@/composables/useTripChat'
 import { getSession, submitFeedback } from '@/services/api'
@@ -366,6 +367,9 @@ function openDislike() {
       </a-card>
     </a-col>
   </a-row>
+
+  <!-- P6：等待确认的问题（超预算、预订审批）。刷新页面后 GET 会话返回的 pending 不为空，也会重新弹出 -->
+  <ConfirmModal v-if="plan && threadId" :chat="chat" />
 
   <!-- P5：窄屏时对话面板收进底部抽屉 -->
   <template v-if="plan && threadId && !isWide">

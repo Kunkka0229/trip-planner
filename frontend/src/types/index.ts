@@ -36,12 +36,37 @@ export type DayPlan = Resp<'DayPlan'>
 export type WeatherInfo = Resp<'WeatherInfo'>
 export type Budget = Resp<'Budget'>
 export type TripPlan = Resp<'TripPlan'>
-export type TripPlanResponse = Resp<'TripPlanResponse'>
 export type POIInfo = Resp<'POIInfo'>
 
 // ============ P5：会话（多轮修改） ============
 
 export type ChatRequest = Schemas['ChatRequest']
 export type ChatMessage = Resp<'ChatMessage'>
-// GET /api/trip/{thread_id}、POST /api/trip/{thread_id}/undo 的返回：行程 + 对话记录
-export type TripSession = Resp<'TripSession'>
+
+// ============ P6：人工确认 ============
+
+// 后端的 pending 是 list[dict]，生成的类型只有 { [key: string]: unknown }，这里手写准确的结构
+// 结构来自后端 graph_planner.py 的 describe_interrupt
+export type PendingQuestion =
+  | {
+      id: string // interrupt 的 id，回答时原样带回
+      kind: 'budget' // budget_check 节点：超预算，问用户接受还是降档
+      question: string
+      total: number
+      amount: number
+      options: Record<'accept' | 'downgrade', string> // 按钮文字
+    }
+  | {
+      id: string
+      kind: 'approval' // 修改 Agent 要执行敏感操作（预订酒店），等用户批准
+      question: string // 后端已经写成人话了，直接显示
+      action: { name: string; args: Record<string, unknown> }
+    }
+
+export type ResumeRequest = Schemas['ResumeRequest']
+export type Decision = ResumeRequest['decision']
+
+// Omit<T, K> & {...}：去掉生成类型里宽泛的 pending，换成上面的准确类型（相当于 TS 里"覆盖一个字段"）
+export type TripPlanResponse = Omit<Resp<'TripPlanResponse'>, 'pending'> & { pending: PendingQuestion[] }
+// GET /api/trip/{thread_id}、POST /api/trip/{thread_id}/undo 的返回：行程 + 对话记录 + 待确认的问题
+export type TripSession = Omit<Resp<'TripSession'>, 'pending'> & { pending: PendingQuestion[] }

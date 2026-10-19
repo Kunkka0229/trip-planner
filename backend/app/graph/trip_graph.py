@@ -21,6 +21,7 @@ from langgraph.runtime import Runtime
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
+from langgraph.types import Command, interrupt
 
 from app.agents.generation import BASE_TEMPERATURE, MAX_ATTEMPTS, build_fallback
 from app.agents.output import parse_and_check, recompute_budget
@@ -33,6 +34,9 @@ from app.planner.grounding import ground_plan
 from app.graph.edit_agent import build_edit_agent
 
 logger = logging.getLogger(__name__)  # __name__ 是模块名，例如 app.graph.trip_graph，日志里会显示出来
+
+# 超出预算多少比例时，暂停下来问用户
+BUDGET_TOLERANCE = 0.2
 
 def error_reason(exc: Exception) -> str:
     """异常 → 一行简短的原因（和第 7 课 generate_plan_with_retries 里的写法一样）"""
@@ -122,6 +126,45 @@ def fallback(state: TripState) -> dict[str, Any]:
     logger.error("大模型多次生成失败，返回兜底方案")
     return {"plan": build_fallback(request, "大模型多次生成失败"), "source": "fallback"}
 
+def budget_check(state: TripState, runtime: Runtime[PlannerDeps]) -> Command[Literal["generate", "__end__"]]:
+    """P6：行程超出预算 20% 以上时，暂停，问用户"接受"还是"降档重新规划"
+
+    返回 Command：同时完成"更新 state"和"决定下一步去哪"，不需要再写一个路由函数
+    Command[Literal[...]] 里列出可能去的节点，LangGraph 画图时才能画出这些边
+    """
+    constraint, plan = state["request"].budget_constraint, state["plan"]
+    if constraint.amount is None or constraint.strictness == "none" or plan.budget is None:
+        return Command(goto=END)
+    total, amount = plan.budget.total, constraint.amount
+    if total <= amount * (1 + BUDGET_TOLERANCE) or state.get("budget_confirmed") or not runtime.context.interactive:
+        return Command(goto=END)
+    
+    # interrupt：暂停整张图，把这个字典交给调用方（最终到达前端）。state 已经由 checkpointer 保存好了
+    # 用户回答后，调用方用 Command(resume="downgrade") 恢复，interrupt(...) 的返回值就是 "downgrade"
+    # 注意：恢复时这个节点会从头重新执行一遍，所以 interrupt 之前的代码必须是"可以重复执行"的（这里只是读 state）
+    choice = interrupt({
+        "kind": "budget",
+        "question": f"这份行程预计花费 {total} 元，超出你的预算 {amount} 元（{total / amount - 1:.0%}）",
+        "total": total,
+        "amount": amount,
+        "options": {"accept": "接受这个方案", "downgrade": "降低档次，重新规划"},
+    })
+    
+    if choice == "downgrade":
+        # 回到 generate 重新生成：清掉旧行程、重置重试次数，把"要省钱"作为反馈告诉模型
+        feedback = f"总花费 {total} 元超出了用户预算 {amount} 元。请改选更便宜的酒店和餐厅、减少收费景点，把总花费控制在预算以内"
+        return Command(
+            goto="generate", 
+            update={
+                "plan": None, 
+                "attempts": 0, 
+                "budget_confirmed": True, 
+                "errors": [feedback]
+            }
+        )
+    
+    return Command(goto=END, update={"budget_confirmed": True})
+
 async def assistant(state: TripState, runtime: Runtime[PlannerDeps]) -> dict[str, Any]:
     """P5：多轮修改。把对话和行程交给修改 Agent，拿回新的对话和新的行程"""
     agent = build_edit_agent(runtime.context.llm)
@@ -152,9 +195,9 @@ def retry_or_give_up(state: TripState) -> Literal["generate", "fallback"]:
 def route_after_generate(state: TripState) -> Literal["validate", "generate", "fallback"]:
     return "validate" if state["draft"] else retry_or_give_up(state)
 
-def route_after_validate(state: TripState) -> Literal["generate", "fallback", "__end__"]:
-    # "__end__" 就是 END 常量的值；plan 存在说明校验通过
-    return END if state.get("plan") else retry_or_give_up(state)
+def route_after_validate(state: TripState) -> Literal["generate", "fallback", "budget_check"]:
+    # plan 存在说明校验通过。P6：通过之后先检查预算，而不是直接结束
+    return "budget_check" if state.get("plan") else retry_or_give_up(state)
 
 def build_trip_graph(checkpointer: BaseCheckpointSaver | None = None):
     """checkpointer（P5）：传入后，每执行完一步都会把 state 存下来，同一个 thread_id 的下一次调用能接着上次的 state 继续"""
@@ -166,6 +209,7 @@ def build_trip_graph(checkpointer: BaseCheckpointSaver | None = None):
     builder.add_node("validate", validate)
     builder.add_node("fallback", fallback)
     builder.add_node("assistant", assistant)
+    builder.add_node("budget_check", budget_check)  # P6：它返回 Command 决定去向，不需要再 add_edge
 
     # P3：入口也可以是条件边。正常请求走 collect；评测时传入冻结的 context，直接去 generate
     builder.add_conditional_edges(START, route_start)

@@ -13,12 +13,14 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import StateSnapshot
 
 from app.agents.deps import get_planner_deps
-from app.agents.graph_planner import EmitFn, chat_with_graph, no_emit, plan_with_graph, thread_config
+from app.agents.graph_planner import (
+    EmitFn, chat_with_graph, describe_interrupt, last_reply, no_emit, plan_with_graph, resume_graph, thread_config,
+)
 from app.agents.output import recompute_budget
 from app.config import get_settings
 from app.graph.state import PlannerDeps
 from app.models.schemas import (
-    ChatMessage, ChatRequest, FeedbackRequest, TripPlanResponse, TripRequest, TripSession,
+    ChatMessage, ChatRequest, FeedbackRequest, ResumeRequest, TripPlanResponse, TripRequest, TripSession,
 )
 from app.observability.tracing import score_trace, trace_span
 from app.services.mock_planner import build_mock_plan
@@ -137,7 +139,10 @@ async def run_planner(
         message = f"旅行计划生成成功（第 {result.attempts} 次生成）"
     if result.warnings:
         message += "；注意：" + "；".join(result.warnings[:3])
-    return TripPlanResponse(success=True, message=message, data=result.plan, trace_id=trace_id, thread_id=thread_id)
+    if result.pending:
+        message = "行程已生成，有问题需要你确认"
+    return TripPlanResponse(success=True, message=message, data=result.plan, trace_id=trace_id,
+                            thread_id=thread_id, pending=result.pending)
 
 
 @router.post("/plan", response_model=TripPlanResponse, summary="生成旅行计划")
@@ -178,25 +183,74 @@ def to_chat_messages(messages: list) -> list[ChatMessage]:
     return result
 
 
+def to_session(thread_id: str, snapshot: StateSnapshot) -> TripSession:
+    values = snapshot.values
+    return TripSession(
+        thread_id=thread_id,
+        plan=values["plan"],
+        messages=to_chat_messages(values.get("messages", [])),
+        pending=[describe_interrupt(item) for item in snapshot.interrupts],  # P6
+    )
+
+
 @router.get("/{thread_id}", response_model=TripSession, summary="获取会话（刷新页面后恢复）")
 async def get_session(thread_id: str, graph: Graph, user_id: UserId = "anonymous"):
-    snapshot = await load_session(graph, thread_id, user_id)
-    values = snapshot.values
-    return TripSession(thread_id=thread_id, plan=values["plan"], messages=to_chat_messages(values.get("messages", [])))
+    return to_session(thread_id, await load_session(graph, thread_id, user_id))
+
+
+def done_event(final: dict[str, Any], pending: list[dict[str, Any]]) -> dict[str, Any]:
+    """对话、恢复两个接口的最后一个事件"""
+    plan = final.get("plan")
+    return {"type": "done", "reply": last_reply(final), "plan": plan.model_dump(mode="json") if plan else None,
+            "pending": pending}
 
 
 @router.post("/{thread_id}/chat", summary="用自然语言修改行程（SSE）")
 async def chat(thread_id: str, body: ChatRequest, deps: Deps, graph: Graph, user_id: UserId = "anonymous"):
     if deps is None:
         raise HTTPException(status_code=503, detail="未配置大模型，无法修改行程")
-    await load_session(graph, thread_id, user_id)  # 先检查权限，不通过直接返回 404，不会开始 SSE
+    snapshot = await load_session(graph, thread_id, user_id)  # 先检查权限，不通过直接返回 404，不会开始 SSE
+    if snapshot.interrupts:
+        # P6：还有问题没回答（比如预订在等确认），这时候插进来一条新消息，暂停的那一步就永远接不上了
+        raise HTTPException(status_code=409, detail="还有等待你确认的操作，请先处理")
 
     async def job(emit: EmitFn) -> dict[str, Any]:
         with trace_span("trip_chat", user_id=user_id, session_id=thread_id, input=body.message) as span:
-            reply, plan = await chat_with_graph(graph, thread_id, body.message, deps, emit)
+            final, pending = await chat_with_graph(graph, thread_id, body.message, deps, emit)
             if span is not None:
-                span.update(output=reply)
-        return {"type": "done", "reply": reply, "plan": plan.model_dump(mode="json")}
+                span.update(output=last_reply(final))
+        return done_event(final, pending)
+
+    return sse_response(job)
+
+
+# 用户的选择 → 恢复图时传给 interrupt() 的值
+# budget_check 节点期待的是字符串；HumanInTheLoopMiddleware 期待的是 {"decisions": [...]}
+def resume_value(kind: str, body: ResumeRequest) -> Any:
+    if kind == "budget" and body.decision in ("accept", "downgrade"):
+        return body.decision
+    if kind == "approval" and body.decision == "approve":
+        return {"decisions": [{"type": "approve"}]}
+    if kind == "approval" and body.decision == "reject":
+        return {"decisions": [{"type": "reject", "message": body.message or "用户拒绝了这次操作"}]}
+    raise HTTPException(status_code=422, detail=f"问题类型 {kind} 不接受 {body.decision}")
+
+
+@router.post("/{thread_id}/resume", summary="回答等待确认的问题，从暂停处继续（SSE）")
+async def resume(thread_id: str, body: ResumeRequest, deps: Deps, graph: Graph, user_id: UserId = "anonymous"):
+    if deps is None:
+        raise HTTPException(status_code=503, detail="未配置大模型")
+    snapshot = await load_session(graph, thread_id, user_id)
+    pending = {item["id"]: item for item in (describe_interrupt(i) for i in snapshot.interrupts)}
+    if body.interrupt_id not in pending:
+        # 409 Conflict：问题已经被回答过了（用户双击、两个标签页同时点）。这是幂等的第一道防线
+        raise HTTPException(status_code=409, detail="这个问题已经处理过了，或者不存在")
+    value = resume_value(pending[body.interrupt_id]["kind"], body)
+
+    async def job(emit: EmitFn) -> dict[str, Any]:
+        with trace_span("trip_resume", user_id=user_id, session_id=thread_id, input=body.model_dump()):
+            final, new_pending = await resume_graph(graph, thread_id, body.interrupt_id, value, deps, emit)
+        return done_event(final, new_pending)
 
     return sse_response(job)
 
@@ -224,9 +278,7 @@ async def undo(thread_id: str, graph: Graph, user_id: UserId = "anonymous"):
             await graph.aupdate_state(
                 snapshot.config, {"messages": [AIMessage("已撤销上一次修改。")]}, as_node="assistant"
             )
-            new = await graph.aget_state(thread_config(thread_id))
-            return TripSession(thread_id=thread_id, plan=new.values["plan"],
-                               messages=to_chat_messages(new.values["messages"]))
+            return to_session(thread_id, await graph.aget_state(thread_config(thread_id)))
     raise HTTPException(status_code=400, detail="没有可以撤销的修改")
 
 

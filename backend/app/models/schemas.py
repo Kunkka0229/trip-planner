@@ -224,6 +224,7 @@ class TripPlanResponse(BaseModel):
     data: TripPlan | None = None  # 失败时 data 为 null
     trace_id: str | None = None  # P2：这次生成对应的 Langfuse trace，前端提交反馈时带回来
     thread_id: str | None = None  # P5：会话 ID，之后修改、撤销、刷新页面都靠它
+    pending: list[dict] = Field(default_factory=list)  # P6：等待用户确认的问题；不为空时前端要弹窗
 
 # ============================================================
 # 高德相关模型（第 5 课新增）
@@ -271,3 +272,13 @@ class TripSession(BaseModel):
     thread_id: str
     plan: TripPlan
     messages: list[ChatMessage]
+    pending: list[dict] = Field(default_factory=list)  # P6：等待用户确认的问题；不为空时前端要弹窗
+
+# ============================================================
+# 人工确认（P6 新增）
+# ============================================================
+class ResumeRequest(BaseModel):
+    interrupt_id: str = Field(..., description="要回答的是哪一个问题（来自 interrupt 事件的 id）")
+    # budget 类问题：accept / downgrade；approval 类问题：approve / reject
+    decision: Literal["accept", "downgrade", "approve", "reject"]
+    message: str = Field(default="", max_length=200, description="拒绝时可以附上理由，会告诉模型")

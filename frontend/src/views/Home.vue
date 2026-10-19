@@ -128,7 +128,10 @@ async function handleSubmit() {
     // P5：记下这条提示属于哪个会话，结果页只在同一个会话里显示它
     sessionStorage.setItem('tripMessageThread', result.threadId ?? '')
     // 后端返回的是兜底方案（第 7 课），或者带有警告（第 9 课）时，用黄色提示
-    if (result.message.includes('基础行程') || result.message.includes('注意')) {
+    // P6：生成后暂停等待确认（比如超预算）：结果页会根据会话里的 pending 弹出确认框
+    if (result.pending.length) {
+      message.info('行程已生成，有问题需要你确认')
+    } else if (result.message.includes('基础行程') || result.message.includes('注意')) {
       message.warning(result.message, 6)
     } else {
       message.success('行程生成成功')

@@ -30,6 +30,7 @@ class PlanResult:
     attempts: int
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)  # 不影响使用、但值得告诉用户的问题
+    pending: list[dict] = field(default_factory=list)  # P6：等待用户确认的问题（图暂停了）
 
 def build_fallback(request: TripRequest, reason: str) -> TripPlan:
     fallback = build_mock_plan(request)

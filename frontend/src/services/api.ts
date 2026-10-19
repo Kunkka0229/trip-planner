@@ -1,5 +1,14 @@
 import axios, { AxiosError } from 'axios'
-import type { ChatRequest, FeedbackRequest, TripPlan, TripPlanResponse, TripRequest, TripSession } from '@/types'
+import type {
+  ChatRequest,
+  FeedbackRequest,
+  PendingQuestion,
+  ResumeRequest,
+  TripPlan,
+  TripPlanResponse,
+  TripRequest,
+  TripSession,
+} from '@/types'
 
 // 读取 .env 里的 VITE_API_BASE_URL（只有 VITE_ 开头的变量才会暴露给前端代码）
 // 留空 → baseURL 为 ''，请求发到当前域名的 /api/...，由 Vite 代理转发
@@ -87,6 +96,7 @@ export interface TripPlanResult {
   message: string
   traceId: string | null
   threadId: string | null // P5：会话 ID；没配置大模型（mock 数据）时为 null
+  pending: PendingQuestion[] // P6：等待用户确认的问题（比如超预算），结果页会弹出确认框
 }
 
 /** 生成旅行计划：成功返回行程和后端的提示信息，失败抛出 Error */
@@ -97,7 +107,7 @@ export async function generateTripPlan(request: TripRequest): Promise<TripPlanRe
     throw new Error(data.message || '生成失败')
   }
   // 第 10 课：把 message 一起返回。兜底方案、grounding 警告都写在 message 里（第 7、9 课）
-  return { plan: data.data, message: data.message, traceId: data.trace_id, threadId: data.thread_id }
+  return { plan: data.data, message: data.message, traceId: data.trace_id, threadId: data.thread_id, pending: data.pending }
 }
 
 // ============================================================
@@ -166,7 +176,10 @@ async function openSse<E>(path: string, body: unknown, signal?: AbortSignal) {
       .json()
       .then((data: { detail?: unknown }) => (typeof data.detail === 'string' ? data.detail : ''))
       .catch(() => '')
-    throw new Error(withRequestId(detail || `请求失败（HTTP ${response.status}）`, requestId))
+    // P6：带上状态码，调用方要区分 409（问题已经处理过了 / 还有问题没处理）
+    throw Object.assign(new Error(withRequestId(detail || `请求失败（HTTP ${response.status}）`, requestId)), {
+      status: response.status,
+    })
   }
   const reader = response.body.getReader()
 
@@ -222,6 +235,7 @@ export async function generateTripPlanStream(
             message: event.data.message,
             traceId: event.data.trace_id,
             threadId: event.data.thread_id,
+            pending: event.data.pending,
           }
         }
         throw new Error(withRequestId(event.data.message || '生成失败', requestId))
@@ -246,35 +260,40 @@ export async function undoEdit(threadId: string): Promise<TripSession> {
   return data
 }
 
+/** 取出错误上的 HTTP 状态码（axios 拦截器和 openSse 都会附上），没有时为 undefined */
+export function httpStatus(error: unknown): number | undefined {
+  return (error as Error & { status?: number }).status
+}
+
 /** 撤销失败是不是因为"没有可以撤销的修改"（400）：这种情况前端只需要把按钮置灰 */
 export function isNothingToUndo(error: unknown): boolean {
-  return (error as Error & { status?: number }).status === 400
+  return httpStatus(error) === 400
 }
 
-type ChatEvent =
+type TurnEvent =
   | { type: 'token'; text: string }
   | { type: 'tool_result'; name: string; content: string }
-  | { type: 'done'; reply: string; plan: TripPlan }
+  | { type: 'progress'; stage: string; percent: number } // P6：降档后重新生成行程，会推送和首页一样的进度
+  | { type: 'interrupt' } & PendingQuestion // P6：又有新问题要确认（最终以 done 里的 pending 为准）
+  | { type: 'done'; reply: string; plan: TripPlan | null; pending: PendingQuestion[] }
   | { type: 'error'; message: string }
 
-export interface ChatHandlers {
+export interface TurnHandlers {
   onToken?: (text: string) => void // 助手回复的一小段文字，逐段追加到气泡里（打字机效果）
   onToolResult?: (name: string, content: string) => void // 工具执行结果，例如"已把第 2 天的……"
+  onProgress?: (stage: string) => void // 重新生成行程时的阶段文字
 }
 
-/** 用自然语言修改行程（SSE）。返回助手的完整回复和修改后的行程 */
-export async function chatStream(
-  threadId: string,
-  message: string,
-  handlers: ChatHandlers = {},
-  signal?: AbortSignal,
-): Promise<{ reply: string; plan: TripPlan }> {
-  const body: ChatRequest = { message }
-  const { requestId, events } = await openSse<ChatEvent>(
-    `/api/trip/${encodeURIComponent(threadId)}/chat`,
-    body,
-    signal,
-  )
+/** 一轮对话或恢复的结果：助手的回复、最新的行程、还没回答的问题 */
+export interface TurnResult {
+  reply: string
+  plan: TripPlan | null
+  pending: PendingQuestion[]
+}
+
+/** 对话和恢复两个接口的事件完全一样（后端都以 done_event 结束），共用一个解析循环 */
+async function streamTurn(path: string, body: unknown, handlers: TurnHandlers, signal?: AbortSignal): Promise<TurnResult> {
+  const { requestId, events } = await openSse<TurnEvent>(path, body, signal)
   for await (const event of events) {
     switch (event.type) {
       case 'token':
@@ -283,13 +302,30 @@ export async function chatStream(
       case 'tool_result':
         handlers.onToolResult?.(event.name, event.content)
         break
+      case 'progress':
+        handlers.onProgress?.(event.stage)
+        break
       case 'error':
         throw new Error(withRequestId(event.message, requestId))
       case 'done':
-        return { reply: event.reply, plan: event.plan }
+        return { reply: event.reply, plan: event.plan, pending: event.pending }
     }
   }
   throw new Error(withRequestId('连接意外中断，没有收到结果', requestId))
+}
+
+/** 用自然语言修改行程（SSE）。还有问题没回答时后端返回 409 */
+export function chatStream(threadId: string, message: string, handlers: TurnHandlers = {}, signal?: AbortSignal) {
+  const body: ChatRequest = { message }
+  return streamTurn(`/api/trip/${encodeURIComponent(threadId)}/chat`, body, handlers, signal)
+}
+
+/**
+ * P6：回答等待确认的问题，图从暂停的地方继续（SSE）
+ * 问题已经被回答过（双击、两个标签页）时后端返回 409
+ */
+export function resumeStream(threadId: string, body: ResumeRequest, handlers: TurnHandlers = {}, signal?: AbortSignal) {
+  return streamTurn(`/api/trip/${encodeURIComponent(threadId)}/resume`, body, handlers, signal)
 }
 
 // ============================================================

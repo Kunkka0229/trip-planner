@@ -1,7 +1,7 @@
 """图的"状态"和"依赖"：整张图里所有节点共享的数据结构"""
 
 import operator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal, TypedDict
 
 from langchain_core.language_models import BaseChatModel
@@ -10,6 +10,7 @@ from langgraph.graph.message import add_messages
 
 from app.models.schemas import TripPlan, TripRequest
 from app.services.amap_client import AmapClient
+from app.services.booking import BookingService, get_booking_service
 
 class TripState(TypedDict, total=False):
     request: TripRequest  # 输入：用户的旅行需求
@@ -27,6 +28,7 @@ class TripState(TypedDict, total=False):
     # add_messages：LangGraph 自带的消息 reducer。新消息追加到末尾；id 相同的消息会被替换（而不是重复追加）
     messages: Annotated[list[AnyMessage], add_messages]
     user_id: str  # 这个会话属于谁，防止别人拿着 thread_id 偷看或修改
+    budget_confirmed: bool  # P6：用户已经就"超预算"做过选择了，不要再问第二次
     
 @dataclass
 class PlannerDeps:
@@ -39,4 +41,8 @@ class PlannerDeps:
 
     amap: AmapClient
     llm: BaseChatModel
+    # P6：预订服务（模拟）。field(default_factory=...)：不传时调用这个函数创建默认值（dataclass 的写法）
+    booking: BookingService = field(default_factory=get_booking_service)
+    # P6：有没有人在线回答问题。评测、批处理时设成 False，遇到需要确认的情况按默认方式处理，不中断
+    interactive: bool = True
 

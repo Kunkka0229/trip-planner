@@ -123,6 +123,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/trip/{thread_id}/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 回答等待确认的问题，从暂停处继续（SSE） */
+        post: operations["resume_api_trip__thread_id__resume_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/trip/{thread_id}/undo": {
         parameters: {
             query?: never;
@@ -576,6 +593,25 @@ export interface components {
              */
             infants: number;
         };
+        /** ResumeRequest */
+        ResumeRequest: {
+            /**
+             * Interrupt Id
+             * @description 要回答的是哪一个问题（来自 interrupt 事件的 id）
+             */
+            interrupt_id: string;
+            /**
+             * Decision
+             * @enum {string}
+             */
+            decision: "accept" | "downgrade" | "approve" | "reject";
+            /**
+             * Message
+             * @description 拒绝时可以附上理由，会告诉模型
+             * @default
+             */
+            message: string;
+        };
         /**
          * TripPlan
          * @description 完整的旅行计划
@@ -623,6 +659,10 @@ export interface components {
             trace_id?: string | null;
             /** Thread Id */
             thread_id?: string | null;
+            /** Pending */
+            pending?: {
+                [key: string]: unknown;
+            }[];
         };
         /**
          * TripRequest
@@ -709,6 +749,10 @@ export interface components {
             plan: components["schemas"]["TripPlan"];
             /** Messages */
             messages: components["schemas"]["ChatMessage"][];
+            /** Pending */
+            pending?: {
+                [key: string]: unknown;
+            }[];
         };
         /** ValidationError */
         ValidationError: {
@@ -962,6 +1006,43 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["ChatRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    resume_api_trip__thread_id__resume_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-User-Id"?: string;
+            };
+            path: {
+                thread_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResumeRequest"];
             };
         };
         responses: {

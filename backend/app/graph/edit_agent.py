@@ -13,10 +13,12 @@ import json
 from typing import Any, Callable, Literal, NotRequired
 
 from langchain.agents import AgentState, create_agent
-from langchain.agents.middleware import ModelRequest, SummarizationMiddleware, dynamic_prompt
+from langchain.agents.middleware import (
+    HumanInTheLoopMiddleware, ModelRequest, SummarizationMiddleware, dynamic_prompt,
+)
 from langchain.tools import ToolRuntime, tool
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import ToolMessage, ToolCall
 from langgraph.types import Command
 
 from app.graph.state import PlannerDeps
@@ -163,6 +165,33 @@ def update_day_description(day: int, description: str, runtime: Runtime) -> Comm
         
     return apply_edit(runtime, f"已更新第 {day} 天的概述", mutate)
 
+async def book_hotel(hotel_name: str, check_in: str, nights: int, rooms: int, runtime: Runtime) -> str:
+    """预订酒店（P6）。hotel_name 必须是行程里安排的酒店；check_in 是入住日期 YYYY-MM-DD；nights 是连住几晚；rooms 是房间数。
+    这是付费操作，系统会先请用户确认，用户同意后才会真正下单。"""
+    
+    try:
+        row = find_row(runtime.state, "hotel", hotel_name)
+    except EditError as exc:
+        return f"预订失败：{exc}"
+
+    order = await runtime.context.booking.book_hotel(
+        hotel=row["name"],
+        check_in=check_in,
+        nights=nights,
+        rooms=rooms,
+        unit_price=row["estimated_cost_hint"],
+        # 幂等键用 tool_call_id：同一次工具调用无论被执行几次（比如恢复时重放），都只会下一单
+        idempotency_key=runtime.tool_call_id,
+    )
+    return f"预订成功，订单号 {order.order_id}，{order.hotel} {order.check_in} 入住 {order.nights} 晚 {order.rooms} 间，共 {order.total_price} 元"
+
+def describe_booking(tool_call: ToolCall, state: dict, runtime) -> str:
+    """审批弹窗里给用户看的说明：用人话把"要花多少钱、订什么"讲清楚，而不是丢给用户一串 JSON"""
+    args = tool_call["args"]
+    row = find_candidate(args.get("hotel_name", ""), state["context"]["tool_snapshot"]["hotel_pois"])
+    price = row["estimated_cost_hint"] * args.get("nights", 0) * args.get("rooms", 0) if row else "未知"
+    return f"即将预订 {args.get('hotel_name')}：{args.get('check_in')} 入住 {args.get('nights')} 晚，{args.get('rooms')} 间，预计 {price} 元"
+
 EDIT_TOOLS = [list_candidates, replace_attraction, remove_attraction, add_attraction, replace_meal, update_day_description]
 
 # ---------- 动态系统提示词：每次调用模型前，把"当前的行程"写进去 ----------
@@ -175,6 +204,7 @@ EDIT_SYSTEM_PROMPT = """你是旅行行程的修改助手。用户已经有一�
 4. 工具返回"修改失败"时，根据原因调整做法再试，不要放弃也不要编造。
 5. 全部改完后，用一两句话告诉用户改了什么、预算有什么变化。
 6. 用户只是提问（比如"第二天去哪"）时，直接根据当前行程回答，不要调用修改工具。
+7. 用户要求预订酒店时，按行程里的酒店和日期调用 book_hotel；房间数按同行人数计算（2 人一间）。用户拒绝预订时，不要再次尝试。
 
 当前行程（day 从 1 开始）：
 {plan}
@@ -223,6 +253,11 @@ def build_edit_agent(llm: BaseChatModel):
             # 对话太长时，把较早的消息压缩成一段摘要，只保留最近 20 条原文
             # 不压缩的话，聊得越久，每次调用的 token 越多，越来越慢、越来越贵，最终超出模型的上下文长度
             SummarizationMiddleware(model=llm, trigger=("tokens", 6000), keep=("messages", 20)),
+            # P6：调用 book_hotel 之前暂停，等用户批准或拒绝。其他工具不受影响，照常自动执行
+            # 原理：模型输出工具调用之后（after_model），中间件检查有没有要审批的工具，有就 interrupt()
+            HumanInTheLoopMiddleware(
+                interrupt_on={"book_hotel": {"allowed_decisions": ["approve", "reject"], "description": describe_booking}}
+            ),
         ],
         name="trip_editor",
     )

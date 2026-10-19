@@ -40,9 +40,10 @@ watch(
   <div class="chat-panel">
     <div class="chat-header">
       <span class="chat-title">💬 对话修改行程</span>
+      <!-- P6：有问题等待确认时不能撤销：撤销会从更早的存档分叉，暂停的那一步就接不上了 -->
       <a-button
         size="small"
-        :disabled="!chat.canUndo.value || chat.sending.value"
+        :disabled="!chat.canUndo.value || chat.sending.value || chat.blocked.value"
         :loading="chat.undoing.value"
         @click="chat.undo()"
       >
@@ -63,10 +64,22 @@ watch(
             <a-tag v-for="(t, j) in m.tools" :key="j" color="blue" class="tool-tag">🔧 {{ t }}</a-tag>
           </div>
           <span v-if="m.content">{{ m.content }}</span>
-          <a-spin v-else-if="m.pending" size="small" />
+          <span v-else-if="m.pending" class="bubble-status">
+            <a-spin size="small" />
+            <!-- P6：降档重新生成时显示阶段文字 -->
+            <span v-if="m.status">{{ m.status }}</span>
+          </span>
         </div>
       </div>
     </div>
+
+    <!-- P6：有问题等待确认。确认框被关掉后，从这里重新打开 -->
+    <a-alert v-if="chat.blocked.value" type="warning" show-icon class="chat-blocked">
+      <template #message>
+        有一个操作等待你确认
+        <a-button type="link" size="small" @click="chat.confirmOpen.value = true">去处理</a-button>
+      </template>
+    </a-alert>
 
     <div class="chat-quick">
       <a-tag
@@ -84,12 +97,12 @@ watch(
         v-model:value="input"
         :auto-size="{ minRows: 1, maxRows: 4 }"
         :maxlength="500"
-        :disabled="chat.sending.value"
-        placeholder="说说想怎么改，Enter 发送"
+        :disabled="chat.sending.value || chat.blocked.value"
+        :placeholder="chat.blocked.value ? '请先处理上面的确认' : '说说想怎么改，Enter 发送'"
         @keydown="onKeydown"
       />
       <a-button v-if="chat.sending.value" danger @click="chat.stop()">停止</a-button>
-      <a-button v-else type="primary" :disabled="!input.trim()" @click="submit">发送</a-button>
+      <a-button v-else type="primary" :disabled="!input.trim() || chat.blocked.value" @click="submit">发送</a-button>
     </div>
   </div>
 </template>
@@ -173,6 +186,17 @@ watch(
 .tool-tag {
   white-space: normal; /* 工具结果可能较长，允许换行 */
   margin-inline-end: 0;
+}
+
+.bubble-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: rgba(0, 0, 0, 0.45);
+}
+
+.chat-blocked {
+  margin-top: 8px;
 }
 
 .chat-quick {
