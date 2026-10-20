@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import type { Dayjs } from 'dayjs'
-import { generateTripPlanStream, type DraftDay, type ToolEvent } from '@/services/api'
+import { generateTripPlanStream, getMemories, type DraftDay, type ToolEvent } from '@/services/api'
 import type { BudgetStrictness, TripRequest } from '@/types'
 
 const router = useRouter()
@@ -61,6 +61,18 @@ function cancelGenerate() {
 
 // 离开首页（比如点了别的路由）时也中止，避免后端白白继续生成
 onBeforeUnmount(cancelGenerate)
+
+// ---------- P7：长期记忆提示 ----------
+// 后端生成时会自动召回记忆放进 prompt；这里只是告诉用户"AI 会参考哪些偏好"，点击可以去管理
+const memoryHints = ref<string[]>([])
+
+onMounted(async () => {
+  try {
+    memoryHints.value = (await getMemories()).slice(0, 3).map((m) => m.text)
+  } catch {
+    // 只是一条提示，拿不到（后端没启动、没配置 store）就不显示，不打扰用户
+  }
+})
 
 // a-form 校验通过后才会触发 @finish
 async function handleSubmit() {
@@ -155,6 +167,14 @@ async function handleSubmit() {
 
 <template>
   <a-card title="规划你的旅行">
+    <!-- P7：取前 3 条记忆，点击跳到记忆页 -->
+    <a-alert v-if="memoryHints.length" type="info" show-icon class="memory-hint" @click="router.push({ name: 'memories' })">
+      <template #message>
+        已根据你的偏好调整：{{ memoryHints.join('、') }}
+        <a class="memory-link">管理 ›</a>
+      </template>
+    </a-alert>
+
     <!-- layout="vertical"：标签在输入框上方；@finish：校验通过后的提交回调 -->
     <a-form :model="form" layout="vertical" @finish="handleSubmit">
       <a-row :gutter="16">
@@ -267,6 +287,15 @@ async function handleSubmit() {
 </template>
 
 <style scoped>
+.memory-hint {
+  margin-bottom: 16px;
+  cursor: pointer;
+}
+
+.memory-link {
+  margin-left: 8px;
+}
+
 .progress-line {
   display: flex;
   align-items: center;

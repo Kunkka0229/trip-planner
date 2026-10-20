@@ -29,6 +29,7 @@ class TripState(TypedDict, total=False):
     messages: Annotated[list[AnyMessage], add_messages]
     user_id: str  # 这个会话属于谁，防止别人拿着 thread_id 偷看或修改
     budget_confirmed: bool  # P6：用户已经就"超预算"做过选择了，不要再问第二次
+    memories: list[str]  # P7：从长期记忆里召回的用户偏好
     
 @dataclass
 class PlannerDeps:
@@ -45,4 +46,5 @@ class PlannerDeps:
     booking: BookingService = field(default_factory=get_booking_service)
     # P6：有没有人在线回答问题。评测、批处理时设成 False，遇到需要确认的情况按默认方式处理，不中断
     interactive: bool = True
+    
 

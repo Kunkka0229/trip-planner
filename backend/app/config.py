@@ -76,6 +76,11 @@ class Settings(BaseSettings):
     
     # ---------- 会话持久化（P5）----------
     checkpoint_url: str = "sqlite:///data/checkpoints.db"  # 写法见 app/graph/checkpoint.py
+
+    # ---------- 长期记忆（P7）----------
+    store_url: str = "sqlite:///data/store.db"  # 写法和 checkpoint_url 一样
+    embedding_model: str = ""  # 留空 = 不建向量索引，召回时不按相关性排序；百炼可填 text-embedding-v4
+    embedding_dims: int = 1024  # 向量维度，要和 embedding 模型的输出一致
     
     # @property：把方法变成"只读属性"，调用时不用加括号：settings.cors_origins_list
     # 类似 JS class 里的 get corsOriginsList() { ... }

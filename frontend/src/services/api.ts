@@ -2,6 +2,7 @@ import axios, { AxiosError } from 'axios'
 import type {
   ChatRequest,
   FeedbackRequest,
+  MemoryItem,
   PendingQuestion,
   ResumeRequest,
   TripPlan,
@@ -336,4 +337,25 @@ export function resumeStream(threadId: string, body: ResumeRequest, handlers: Tu
 export async function submitFeedback(body: FeedbackRequest): Promise<{ success: boolean; message: string }> {
   const { data } = await http.post<{ success: boolean; message: string }>('/api/trip/feedback', body)
   return data
+}
+
+// ============================================================
+// P7：长期记忆（"AI 记住了我什么"）
+// ============================================================
+
+/** 当前用户（X-User-Id）的全部长期记忆 */
+export async function getMemories(): Promise<MemoryItem[]> {
+  const { data } = await http.get<MemoryItem[]>('/api/me/memories')
+  return data
+}
+
+/** 删除一条记忆。只能删自己的：别人的 key 在自己的 namespace 里找不到，后端返回 404 */
+export async function deleteMemory(key: string): Promise<void> {
+  await http.delete(`/api/me/memories/${encodeURIComponent(key)}`)
+}
+
+/** 清空全部记忆，返回删掉了几条 */
+export async function clearMemories(): Promise<number> {
+  const { data } = await http.delete<{ success: boolean; deleted: number }>('/api/me/memories')
+  return data.deleted
 }

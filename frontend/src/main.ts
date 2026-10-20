@@ -5,6 +5,7 @@ import 'ant-design-vue/dist/reset.css' // antd 的基础样式重置
 import App from './App.vue'
 import Home from './views/Home.vue'
 import Result from './views/Result.vue'
+import Memories from './views/Memories.vue'
 
 const router = createRouter({
   history: createWebHistory(), // HTML5 history 模式，URL 里没有 #
@@ -15,6 +16,7 @@ const router = createRouter({
     //   没有 thread_id：没配置大模型时的 mock 数据，没有会话，退回读 sessionStorage
     // meta.wide：结果页右侧有对话面板，需要更宽的内容区（App.vue 里读取）
     { path: '/result/:threadId?', name: 'result', component: Result, meta: { wide: true } },
+    { path: '/memories', name: 'memories', component: Memories }, // P7：AI 记住了什么
   ],
 })
 

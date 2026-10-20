@@ -70,3 +70,8 @@ export type Decision = ResumeRequest['decision']
 export type TripPlanResponse = Omit<Resp<'TripPlanResponse'>, 'pending'> & { pending: PendingQuestion[] }
 // GET /api/trip/{thread_id}、POST /api/trip/{thread_id}/undo 的返回：行程 + 对话记录 + 待确认的问题
 export type TripSession = Omit<Resp<'TripSession'>, 'pending'> & { pending: PendingQuestion[] }
+
+// ============ P7：长期记忆 ============
+
+// GET /api/me/memories 的一项。category 后端是 str，取值见后端 memories.py 的 NewMemory
+export type MemoryItem = Resp<'MemoryItem'>

@@ -22,6 +22,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.types import Command, interrupt
+from langgraph.store.base import BaseStore
 
 from app.agents.generation import BASE_TEMPERATURE, MAX_ATTEMPTS, build_fallback
 from app.agents.output import parse_and_check, recompute_budget
@@ -32,6 +33,7 @@ from app.models.schemas import WeatherInfo
 from app.planner.context import compact_for_prompt
 from app.planner.grounding import ground_plan
 from app.graph.edit_agent import build_edit_agent
+from app.memory.memories import format_memories, recall
 
 logger = logging.getLogger(__name__)  # __name__ 是模块名，例如 app.graph.trip_graph，日志里会显示出来
 
@@ -69,8 +71,19 @@ async def generate(state: TripState, runtime: Runtime[PlannerDeps]) -> dict[str,
     
     writer = get_stream_writer()
     attempt = state.get("attempts", 0) + 1
+
+    request = state["request"]
     context_json = json.dumps(compact_for_prompt(state["context"]), ensure_ascii=False, separators=(",", ":"))
-    prompt = build_context_prompt(context_json, state["request"].travel_days)
+    prompt = build_context_prompt(context_json, request.travel_days)
+
+    # P7：召回用户的长期偏好。runtime.store 是编译图时传入的 store（没传时是 None，比如评测）
+    # 只在第一次生成时召回，结果存进 state，重试时直接用
+    memories = state.get("memories")
+    if memories is None:
+        query = f"{request.city} {' '.join(request.preferences)} {request.free_text_input}"
+        memories = await recall(runtime.store, state.get("user_id"), query)
+    prompt += format_memories(memories)
+
     if errors := state.get("errors"):
         prompt += f"\n\n注意：上一次的输出不合格，原因是：{errors[-1]}。请修正后重新输出完整 JSON。"
         writer({"type": "reset"})  # 重试：让前端清掉上一次的草稿
@@ -95,9 +108,9 @@ async def generate(state: TripState, runtime: Runtime[PlannerDeps]) -> dict[str,
             sent = max(sent, len(days))
     except Exception as exc:  # 超时、网络错误：记一次失败，draft 置空
         logger.warning("第 %d/%d 次调用失败: %s", attempt, MAX_ATTEMPTS, error_reason(exc))
-        return {"attempts": attempt, "draft": "", "errors": [error_reason(exc)]}
+        return {"attempts": attempt, "draft": "", "errors": [error_reason(exc)], "memories": memories}
     
-    return {"attempts": attempt, "draft": "".join(parts)}
+    return {"attempts": attempt, "draft": "".join(parts), "memories": memories}
 
 def validate(state: TripState) -> dict[str, Any]:
     """校验 + grounding + 天气覆盖 + 预算重算（原来 context_planner 里 postprocess 闭包做的事）"""
@@ -168,8 +181,10 @@ def budget_check(state: TripState, runtime: Runtime[PlannerDeps]) -> Command[Lit
 async def assistant(state: TripState, runtime: Runtime[PlannerDeps]) -> dict[str, Any]:
     """P5：多轮修改。把对话和行程交给修改 Agent，拿回新的对话和新的行程"""
     agent = build_edit_agent(runtime.context.llm)
+    # P7：用用户最新的一句话去召回相关的长期记忆
+    memories = await recall(runtime.store, state.get("user_id"), state["messages"][-1].text)
     # 在节点里调用另一张图：config（回调、checkpointer）会自动传下去，trace 里它显示为 assistant 的子节点
-    result = await agent.ainvoke({key: state[key] for key in ("messages", "plan", "context", "request")})
+    result = await agent.ainvoke({key: state[key] for key in ("messages", "plan", "context", "request")} | {"memories": memories})
     # 修改 Agent 可能把较早的消息压缩成了摘要（SummarizationMiddleware），
     # 所以先清空主图里的消息，再整体换成 Agent 返回的版本，两边保持一致
     return {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *result["messages"]], "plan": result["plan"]}
@@ -199,8 +214,10 @@ def route_after_validate(state: TripState) -> Literal["generate", "fallback", "b
     # plan 存在说明校验通过。P6：通过之后先检查预算，而不是直接结束
     return "budget_check" if state.get("plan") else retry_or_give_up(state)
 
-def build_trip_graph(checkpointer: BaseCheckpointSaver | None = None):
-    """checkpointer（P5）：传入后，每执行完一步都会把 state 存下来，同一个 thread_id 的下一次调用能接着上次的 state 继续"""
+def build_trip_graph(checkpointer: BaseCheckpointSaver | None = None, store: BaseStore | None = None):
+    """checkpointer（P5）：传入后，每执行完一步都会把 state 存下来，同一个 thread_id 的下一次调用能接着上次的 state 继续
+    store（P7）：长期记忆。传入后，节点里可以通过 runtime.store 读写，跨会话共享
+    """
 
     builder = StateGraph(TripState, context_schema=PlannerDeps)
     # 编译好的子图可以直接当成一个节点：主图只看到它的输入（request）和输出（context）
@@ -220,7 +237,7 @@ def build_trip_graph(checkpointer: BaseCheckpointSaver | None = None):
     builder.add_conditional_edges("validate", route_after_validate)
     builder.add_edge("fallback", END)
     builder.add_edge("assistant", END)
-    return builder.compile(checkpointer=checkpointer)
+    return builder.compile(checkpointer=checkpointer, store=store)
 
 # 图的结构是固定的，模块加载时编译一次，所有请求共用（依赖通过 context 每次传入）
 trip_graph = build_trip_graph()

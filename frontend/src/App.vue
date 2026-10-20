@@ -13,7 +13,11 @@ const route = useRoute()
   <!-- ConfigProvider：给所有 antd 组件设置全局配置（这里是中文语言包） -->
   <a-config-provider :locale="zhCN">
     <a-layout class="app-layout">
-      <a-layout-header class="app-header">HelloAgents 智能旅行助手</a-layout-header>
+      <a-layout-header class="app-header">
+        <router-link to="/" class="app-title">HelloAgents 智能旅行助手</router-link>
+        <!-- P7：个人中心入口，查看和删除 AI 记住的偏好 -->
+        <router-link to="/memories" class="app-nav">🧠 AI 记住了什么</router-link>
+      </a-layout-header>
       <!-- P5：结果页（meta.wide）多了对话面板，内容区放宽 -->
       <a-layout-content :class="['app-content', { 'app-content-wide': route.meta.wide }]">
         <router-view />
@@ -33,8 +37,24 @@ const route = useRoute()
   background: #fff;
   border-bottom: 1px solid #e2e8f0;
   color: #0f172a;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.app-title {
+  color: #0f172a;
   font-size: 18px;
   font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.app-nav {
+  font-size: 14px;
+  white-space: nowrap;
 }
 
 .app-content {

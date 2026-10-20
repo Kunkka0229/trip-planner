@@ -7,7 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware  # FastAPI 自带的 CORS 中间件
 
-from app.api.routes import demo, trip, poi  # 导入路由模块
+from app.api.routes import demo, me, trip, poi  # 导入路由模块
 from app.api.routes import map as map_routes  # map 和 Python 内置函数 map() 重名，起个别名避免覆盖
 from app.services.amap_client import AmapError
 
@@ -17,10 +17,21 @@ from app.observability.tracing import shutdown_tracing
 from app.graph.checkpoint import open_checkpointer
 from app.graph.trip_graph import build_trip_graph
 
+from app.memory.memories import MemoryWriter
+from app.memory.store import open_store
+from app.services.llm_service import LLMNotConfiguredError, get_llm
+
 logger = logging.getLogger(__name__)
 
 settings = get_settings()  # 取配置中心的配置对象
 setup_logging(settings.log_level)  # P2：在创建 app 之前配置好日志
+
+def memory_llm():
+    """P7：记忆抽取用的模型。现在和规划用同一个配置，P12 会换成更便宜的小模型"""
+    try:
+        return get_llm()
+    except LLMNotConfiguredError:
+        return None
 
 def status_of(value: str) -> str:
     """密钥只显示"已配置/未配置"，避免在日志里泄露"""
@@ -41,9 +52,15 @@ async def lifespan(app: FastAPI):
 
     # P5：打开 checkpointer，编译带持久化的图，挂到 app.state 上（app.state 是 FastAPI 提供的"全局存储"）
     # 用 async with 包住 yield：服务运行期间连接一直打开，服务关闭时自动关闭
-    async with open_checkpointer(settings.checkpoint_url) as checkpointer:
-        app.state.trip_graph = build_trip_graph(checkpointer=checkpointer)
+    async with (
+        open_checkpointer(settings.checkpoint_url) as checkpointer,
+        open_store(settings.store_url) as store,
+    ):
+        app.state.store = store
+        app.state.memory_writer = MemoryWriter(llm=memory_llm())
+        app.state.trip_graph = build_trip_graph(checkpointer=checkpointer, store=store)
         yield  # ← 服务在这里运行，直到收到关闭信号
+        await app.state.memory_writer.drain()  # P7：等后台的记忆更新做完，再关闭 store
     shutdown_tracing()  # P2：把还没上报的 trace 发完再退出
     logger.info("服务已关闭")
     
@@ -100,6 +117,7 @@ app.include_router(demo.router, prefix="/api")  # demo 测试接口
 app.include_router(trip.router, prefix="/api")  # 旅行规划接口
 app.include_router(poi.router, prefix="/api")
 app.include_router(map_routes.router, prefix="/api")
+app.include_router(me.router, prefix="/api")  # P7：我的记忆
 
 @app.get("/")
 def root():

@@ -41,6 +41,18 @@ def get_graph(request: Request) -> CompiledStateGraph:
     """P5：带 checkpointer 的图在启动时编译好，挂在 app.state 上（见 main.py 的 lifespan）"""
     return request.app.state.trip_graph
 
+def remember(request: Request, user_id: str, texts: list[str], source: str) -> None:
+    """P7：在后台更新长期记忆（不等它完成，不影响响应速度）"""
+    request.app.state.memory_writer.schedule(request.app.state.store, user_id, texts, source)
+
+def request_texts(request: TripRequest) -> list[str]:
+    """P7：生成行程时，用户在表单里填的哪些内容可能值得记住"""
+    party = request.party
+    return [
+        f"同行：成人 {party.adults}，儿童 {party.children}，婴儿 {party.infants}；住宿偏好：{request.accommodation}",
+        f"偏好标签：{'、'.join(request.preferences)}" if request.preferences else "",
+        request.free_text_input,
+    ]
 
 Graph = Annotated[CompiledStateGraph, Depends(get_graph)]
 Deps = Annotated[PlannerDeps | None, Depends(get_planner_deps)]
@@ -144,16 +156,32 @@ async def run_planner(
     return TripPlanResponse(success=True, message=message, data=result.plan, trace_id=trace_id,
                             thread_id=thread_id, pending=result.pending)
 
-
+# http: Request 是 FastAPI 的原始请求对象（用来访问 app.state）。参数名不能叫 request，已经被 TripRequest 占用了
 @router.post("/plan", response_model=TripPlanResponse, summary="生成旅行计划")
-async def plan_trip(request: TripRequest, deps: Deps, graph: Graph, user_id: UserId = "anonymous"):
-    return await run_planner(request, deps, graph, user_id)
-
+async def plan_trip(
+    request: TripRequest, 
+    http: Request, 
+    deps: Deps, 
+    graph: Graph, 
+    user_id: UserId = "anonymous"
+):
+    response = await run_planner(request, deps, graph, user_id)
+    if response.thread_id:
+        remember(http, user_id, request_texts(request), response.thread_id)
+    return response
 
 @router.post("/plan/stream", summary="生成旅行计划（SSE 推送进度和逐天草稿）")
-async def plan_trip_stream(request: TripRequest, deps: Deps, graph: Graph, user_id: UserId = "anonymous"):
+async def plan_trip_stream(
+    request: TripRequest, 
+    http: Request,
+    deps: Deps, 
+    graph: Graph, 
+    user_id: UserId = "anonymous"
+):
     async def job(emit: EmitFn) -> dict[str, Any]:
         response = await run_planner(request, deps, graph, user_id, emit)
+        if response.thread_id:
+            remember(http, user_id, request_texts(request), response.thread_id)
         return {"type": "result", "data": response.model_dump(mode="json")}
 
     return sse_response(job)
@@ -198,15 +226,22 @@ async def get_session(thread_id: str, graph: Graph, user_id: UserId = "anonymous
     return to_session(thread_id, await load_session(graph, thread_id, user_id))
 
 
-def done_event(final: dict[str, Any], pending: list[dict[str, Any]]) -> dict[str, Any]:
+def done_event(
+    final: dict[str, Any], 
+    pending: list[dict[str, Any]],
+) -> dict[str, Any]:
     """对话、恢复两个接口的最后一个事件"""
     plan = final.get("plan")
-    return {"type": "done", "reply": last_reply(final), "plan": plan.model_dump(mode="json") if plan else None,
-            "pending": pending}
+    return {
+        "type": "done", 
+        "reply": last_reply(final), 
+        "plan": plan.model_dump(mode="json") if plan else None,
+        "pending": pending
+    }
 
 
 @router.post("/{thread_id}/chat", summary="用自然语言修改行程（SSE）")
-async def chat(thread_id: str, body: ChatRequest, deps: Deps, graph: Graph, user_id: UserId = "anonymous"):
+async def chat(thread_id: str, http: Request, body: ChatRequest, deps: Deps, graph: Graph, user_id: UserId = "anonymous"):
     if deps is None:
         raise HTTPException(status_code=503, detail="未配置大模型，无法修改行程")
     snapshot = await load_session(graph, thread_id, user_id)  # 先检查权限，不通过直接返回 404，不会开始 SSE
@@ -219,6 +254,8 @@ async def chat(thread_id: str, body: ChatRequest, deps: Deps, graph: Graph, user
             final, pending = await chat_with_graph(graph, thread_id, body.message, deps, emit)
             if span is not None:
                 span.update(output=last_reply(final))
+        
+        remember(http, user_id, [body.message], thread_id)  # P7
         return done_event(final, pending)
 
     return sse_response(job)
