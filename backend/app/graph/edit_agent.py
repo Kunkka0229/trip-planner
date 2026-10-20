@@ -22,6 +22,7 @@ from langchain_core.messages import ToolMessage, ToolCall
 from langgraph.types import Command
 
 from app.graph.state import PlannerDeps
+from app.memory.memories import format_memories
 from app.agents.output import PlanValidationError, recompute_budget, validate_plan
 from app.models.schemas import Attraction, Location, Meal, TripPlan, TripRequest
 from app.planner.grounding import find_candidate
@@ -32,6 +33,9 @@ class TripChatState(AgentState):
     request: NotRequired[TripRequest]
     context: NotRequired[dict[str, Any]]
     plan: NotRequired[TripPlan]
+    # P7：assistant 节点召回的长期记忆。必须在这里声明：LangGraph 只认 state 里声明过的字段，
+    # 输入里多出来的 key 会被直接丢掉，也不报错（模型就看不到记忆了）
+    memories: NotRequired[list[str]]
     
 # ToolRuntime[上下文类型, state 类型]：写全泛型参数。只写 ToolRuntime 时，LangChain 会按"上下文是 None"去序列化，
 # 而我们传进来的是 PlannerDeps，Pydantic 会打印一大串 PydanticSerializationUnexpectedValue 警告
@@ -210,7 +214,7 @@ EDIT_SYSTEM_PROMPT = """你是旅行行程的修改助手。用户已经有一�
 {plan}
 
 用户的原始需求：
-{request}"""
+{request}{memories}"""
 
 def plan_outline(plan: TripPlan) -> str:
     """精简的行程，给模型看：不需要坐标、地址这些细节"""
@@ -237,6 +241,7 @@ def edit_prompt(request: ModelRequest) -> str:
     return EDIT_SYSTEM_PROMPT.format(
         plan=plan_outline(state["plan"]),
         request=state["request"].model_dump_json(include={"city", "preferences", "free_text_input", "party", "budget_constraint"}),
+        memories=format_memories(state.get("memories", [])),  # P7：没有记忆时是空字符串，prompt 不变
     )
 
 def build_edit_agent(llm: BaseChatModel):
