@@ -24,6 +24,18 @@ HOTEL_PRICE_BY_LEVEL = {"经济型酒店": 300, "舒适型酒店": 500, "高端�
 # 名称或分类里含这些词的景点，通常免费
 FREE_ATTRACTION_WORDS = ("公园", "广场", "博物馆", "纪念馆", "步行街", "胡同", "大学")
 
+def season_of(month: int) -> str:
+    """P8：从 ticket_season 里拆出来，MCP 工具只知道月份，没有 TripRequest"""
+    if month in (11, 12, 1, 2, 3):
+        return "off_season"
+    if month in (7, 8):
+        return "peak_season"
+    return "normal_season"
+
+def ticket_season(request: TripRequest) -> str:
+    """按出发月份粗分票价季节：11-3 月淡季，7-8 月旺季，其余平季（不考虑节假日）"""
+    return season_of(request.start_date.month)
+
 # 只在第一次调用时读文件，之后直接返回缓存（和 get_settings 一样的单例技巧）
 @lru_cache
 def load_price_table() -> dict[tuple[str, str], dict]:
@@ -48,19 +60,23 @@ def ticket_season(request: TripRequest) -> str:
         return "peak_season"
     return "normal_season"
 
-def ticket_price_hint(poi: POIInfo, request: TripRequest) -> tuple[int, str]:
-    """返回 (成人票价, 价格来源)：先查价格表，查不到再走关键词规则"""
+def ticket_price_for(poi: POIInfo, city: str, month: int) -> tuple[int, str]:
+    """P8：ticket_price_hint 的"不依赖 TripRequest"版本，MCP 工具直接用"""
+    
     # removesuffix：去掉末尾的"市"，"北京市" → "北京"，和表里的城市名对齐
-    profile = load_price_table().get((request.city.removesuffix("市"), poi.name))
+    profile = load_price_table().get((city.removesuffix("市"), poi.name))
     if profile:
         # 例如故宫：{"off_season": 40, "normal_season": 60, "peak_season": 60}
-        return int(profile[ticket_season(request)]), "price_table"
-    
+        return int(profile[season_of(month)]), "price_table"
     # 查表优先于规则：天坛公园名字里有"公园"，按规则会判成免费，但表里是 10 元
     text = poi.name + poi.type
     if any(word in text for word in FREE_ATTRACTION_WORDS):  # any：只要有一个满足就为 True
         return 0, "rule_free"
     return 60, "default"
+
+def ticket_price_hint(poi: POIInfo, request: TripRequest) -> tuple[int, str]:
+    """返回 (成人票价, 价格来源)：先查价格表，查不到再走关键词规则"""
+    return ticket_price_for(poi, request.city, request.start_date.month)
 
 def meal_cost_hint(poi: POIInfo) -> tuple[int, str]:
     """返回 (人均价格, 价格来源)：优先用高德的人均消费"""
@@ -68,9 +84,13 @@ def meal_cost_hint(poi: POIInfo) -> tuple[int, str]:
         return round(poi.cost), "amap_cost"
     return 60, "default"
 
-def hotel_cost_hint(poi: POIInfo, request: TripRequest) -> tuple[int, str]:
-    """返回 (每间每晚价格, 价格来源)"""
+def hotel_cost_for(poi: POIInfo, accommodation: str) -> tuple[int, str]:
+    """P8：hotel_cost_hint 的"不依赖 TripRequest"版本"""
     if poi.cost and poi.cost > 0:
         return round(poi.cost), "amap_cost"
     # dict.get(key, 默认值)：找不到住宿类型时按 400 算
-    return HOTEL_PRICE_BY_LEVEL.get(request.accommodation, 400), "level_default"
+    return HOTEL_PRICE_BY_LEVEL.get(accommodation, 400), "level_default"
+
+def hotel_cost_hint(poi: POIInfo, request: TripRequest) -> tuple[int, str]:
+    """返回 (每间每晚价格, 价格来源)"""
+    return hotel_cost_for(poi, request.accommodation)
