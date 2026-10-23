@@ -27,6 +27,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.config import get_settings
 from app.models.schemas import WeatherInfo
+from app.observability.logs import setup_logging
 from app.planner.pricing import hotel_cost_for, load_price_table, meal_cost_hint, ticket_price_for
 from app.services.amap_client import AmapClient, AmapError, get_amap_client
 
@@ -170,6 +171,8 @@ def build_app(token: str) -> ASGIApp:
 
 if __name__ == "__main__":
     settings = get_settings()
+    # 和主服务用同一套日志配置：httpx 的请求日志会带上完整 URL，高德的 key 就在 URL 里，不能打到终端
+    setup_logging(settings.log_level)
     if not settings.mcp_token:
         print("⚠️  没有设置 MCP_TOKEN，任何人都能调用这个服务，只能在本机开发时这样做")
     uvicorn.run(build_app(settings.mcp_token), host="127.0.0.1", port=settings.mcp_port)

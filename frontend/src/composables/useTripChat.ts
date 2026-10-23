@@ -6,35 +6,42 @@ import { message } from 'ant-design-vue'
 import { chatStream, getSession, httpStatus, isNothingToUndo, resumeStream, undoEdit, type TurnResult } from '@/services/api'
 import type { ChatMessage, Decision, PendingQuestion, TripPlan, TripSession } from '@/types'
 
-/** P8：search_more_places 新加入候选的地点（后端只给模型看这三个字段） */
+/** list_candidates / search_more_places 返回的地点（后端只给模型看名字、区、价格这几个字段） */
 export interface FoundPlace {
   name: string
   district: string
-  price: number
+  price: number | null
 }
 
-/** 一次工具调用的结果。places 有值时显示成"🔍 搜到了 N 个新地点"，可以展开看名字和价格 */
+/** 一次工具调用的结果。places 有值时显示成可展开的列表，例如"🔍 搜到了 N 个新地点" */
 export interface ToolEntry {
+  icon: string
   text: string
   places?: FoundPlace[]
 }
 
+/** 返回地点列表的工具：content 去掉前缀后是 JSON 列表 */
+const PLACE_TOOLS: Record<string, { prefix: string; icon: string; label: (n: number) => string }> = {
+  list_candidates: { prefix: '', icon: '📋', label: (n) => `查看了 ${n} 个候选` },
+  search_more_places: { prefix: '已加入候选：', icon: '🔍', label: (n) => `搜到了 ${n} 个新地点` }, // P8
+}
+
 /**
  * 把工具结果整理成界面要显示的样子
- * search_more_places 成功时 content 是"已加入候选：[{...}, ...]"，冒号后面是 JSON 列表；
+ * 地点列表折叠起来（几十个候选的 JSON 直接显示太长）；
  * 失败（"搜索失败：……"、"没有搜到新的……"）或格式对不上时，按普通文字显示
  */
 function toToolEntry(name: string, content: string): ToolEntry {
-  const PREFIX = '已加入候选：'
-  if (name === 'search_more_places' && content.startsWith(PREFIX)) {
+  const spec = PLACE_TOOLS[name]
+  if (spec && content.startsWith(spec.prefix)) {
     try {
-      const places = JSON.parse(content.slice(PREFIX.length)) as FoundPlace[]
-      return { text: `搜到了 ${places.length} 个新地点`, places }
+      const places = JSON.parse(content.slice(spec.prefix.length)) as FoundPlace[]
+      return { icon: spec.icon, text: spec.label(places.length), places }
     } catch {
       // 解析失败就退回显示原文
     }
   }
-  return { text: content }
+  return { icon: '🔧', text: content }
 }
 
 /** 界面上的一条消息：在后端 ChatMessage 的基础上，加上只在前端用的状态 */

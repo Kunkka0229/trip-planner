@@ -62,17 +62,17 @@ watch(
           <!-- 工具执行结果：模型实际做了哪些修改 -->
           <div v-if="m.tools?.length" class="bubble-tools">
             <template v-for="(t, j) in m.tools" :key="j">
-              <!-- P8：搜索到的新候选，点开看名字和价格（<details> 是浏览器自带的折叠，不用写状态） -->
+              <!-- 查看的候选、P8 搜索到的新候选：点开看名字和价格（<details> 是浏览器自带的折叠，不用写状态） -->
               <details v-if="t.places" class="tool-places">
-                <summary>🔍 {{ t.text }}</summary>
+                <summary>{{ t.icon }} {{ t.text }}</summary>
                 <ul>
                   <li v-for="p in t.places" :key="p.name">
                     <span>{{ p.name }}<span class="place-district">{{ p.district }}</span></span>
-                    <span class="place-price">¥{{ p.price }}</span>
+                    <span v-if="p.price != null" class="place-price">¥{{ p.price }}</span>
                   </li>
                 </ul>
               </details>
-              <a-tag v-else color="blue" class="tool-tag">🔧 {{ t.text }}</a-tag>
+              <a-tag v-else color="blue" class="tool-tag">{{ t.icon }} {{ t.text }}</a-tag>
             </template>
           </div>
           <span v-if="m.content">{{ m.content }}</span>
