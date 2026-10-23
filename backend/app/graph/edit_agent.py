@@ -14,18 +14,21 @@ from typing import Any, Callable, Literal, NotRequired
 
 from langchain.agents import AgentState, create_agent
 from langchain.agents.middleware import (
-    HumanInTheLoopMiddleware, ModelRequest, SummarizationMiddleware, dynamic_prompt,
+    HumanInTheLoopMiddleware, ModelRequest, SummarizationMiddleware, ToolCallLimitMiddleware, ToolRetryMiddleware,
+    dynamic_prompt,
 )
 from langchain.tools import ToolRuntime, tool
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import ToolMessage, ToolCall
 from langgraph.types import Command
+from langchain_core.tools import BaseTool
 
 from app.graph.state import PlannerDeps
 from app.memory.memories import format_memories
 from app.agents.output import PlanValidationError, recompute_budget, validate_plan
 from app.models.schemas import Attraction, Location, Meal, TripPlan, TripRequest
 from app.planner.grounding import find_candidate
+from app.services.trip_mcp import TripMCPError, call_trip_tool
 
 class TripChatState(AgentState):
     """在 create_agent 自带的 state（messages）上，加上行程相关的字段，工具通过 runtime.state 读取"""
@@ -189,6 +192,56 @@ async def book_hotel(hotel_name: str, check_in: str, nights: int, rooms: int, ru
     )
     return f"预订成功，订单号 {order.order_id}，{order.hotel} {order.check_in} 入住 {order.nights} 晚 {order.rooms} 间，共 {order.total_price} 元"
 
+# 
+PRICE_KEYS = {"attraction": "ticket_price_hint", "hotel": "estimated_cost_hint", "food": "meal_cost_hint"}
+
+@tool
+async def search_more_places(kind: Literal["attraction", "hotel", "food"], keyword: str, runtime: Runtime) -> Command | str:
+    """候选里没有用户想要的地点时，用关键词搜索更多候选（例如 烤鸭、亲子乐园、温泉酒店）。
+    搜到的地点会加入候选列表，之后就可以用 replace_attraction / add_attraction / replace_meal 使用它们。"""
+
+    request: TripRequest = runtime.state["request"]
+    try:
+        # P8：通过 MCP 调用我们自己的 trip-data 服务（它和 PlannerContext 用的是同一套价格口径）
+        places = await call_trip_tool("search_places", {
+            "city": request.city, 
+            "keyword": keyword, "kind": kind,
+            "month": request.start_date.month, 
+            "hotel_level": request.accommodation, 
+            "limit": 8,
+        })
+    except TripMCPError as exc:
+        return f"搜索失败：{exc}"
+    
+    context = json.loads(json.dumps(runtime.state["context"]))  # 深拷贝（context 是纯 JSON 数据，这样最简单）
+    rows = context["tool_snapshot"][CANDIDATE_KEYS[kind]]
+    known = {row["name"] for row in rows}
+    added = []
+    for place in places:
+        if place["name"] in known:
+            continue
+        # 转换成和 PlannerContext 里一样的格式，之后的工具、grounding 都能直接用
+        rows.append({
+            "name": place["name"], 
+            "district": place["district"], 
+            "address": place["address"],
+            "location": place["location"], 
+            "rating": place["rating"],
+            PRICE_KEYS[kind]: place["price"], 
+            "price_source": place["price_source"],
+        })
+        added.append({
+            "name": place["name"], 
+            "district": place["district"], 
+            "price": place["price"]
+        })
+    if not added:
+        return f"没有搜到新的「{keyword}」，可以换个关键词"
+    return Command(update={
+        "context": context,
+        "messages": [ToolMessage(f"已加入候选：{json.dumps(added, ensure_ascii=False)}", tool_call_id=runtime.tool_call_id)],
+    })
+
 def describe_booking(tool_call: ToolCall, state: dict, runtime) -> str:
     """审批弹窗里给用户看的说明：用人话把"要花多少钱、订什么"讲清楚，而不是丢给用户一串 JSON"""
     args = tool_call["args"]
@@ -209,6 +262,7 @@ EDIT_SYSTEM_PROMPT = """你是旅行行程的修改助手。用户已经有一�
 5. 全部改完后，用一两句话告诉用户改了什么、预算有什么变化。
 6. 用户只是提问（比如"第二天去哪"）时，直接根据当前行程回答，不要调用修改工具。
 7. 用户要求预订酒店时，按行程里的酒店和日期调用 book_hotel；房间数按同行人数计算（2 人一间）。用户拒绝预订时，不要再次尝试。
+8. 候选里没有用户想要的地点时，先用 search_more_places 搜索（如果有这个工具），再从搜到的结果里选。
 
 当前行程（day 从 1 开始）：
 {plan}
@@ -244,12 +298,19 @@ def edit_prompt(request: ModelRequest) -> str:
         memories=format_memories(state.get("memories", [])),  # P7：没有记忆时是空字符串，prompt 不变
     )
 
-def build_edit_agent(llm: BaseChatModel):
-    """每次调用时用运行时传入的 llm 创建（create_agent 只是把节点连成图，耗时可以忽略）"""
+# P8：依赖 trip-data MCP 服务的工具。服务不可用时整组去掉，Agent 照常工作，只是不能搜索新地点
+MCP_TOOL_NAMES = {"get_weather"}  # 直接交给模型使用的 MCP 工具
+
+def build_edit_agent(llm: BaseChatModel, mcp_tools: list[BaseTool] | None = None):
+    """每次调用时用运行时传入的 llm 创建（create_agent 只是把节点连成图，耗时可以忽略）
+
+    mcp_tools（P8）：从 trip-data MCP 服务加载的工具；传了说明服务可用，同时启用 search_more_places
+    """
     
+    extra = [search_more_places, *mcp_tools] if mcp_tools else []
     return create_agent(
         llm,
-        tools=EDIT_TOOLS,
+        tools=[*EDIT_TOOLS, *extra],
         state_schema=TripChatState,
         # 外层图的运行时依赖（PlannerDeps）会自动传进来，这里声明一下类型，否则 Pydantic 会报序列化警告
         context_schema=PlannerDeps,
@@ -258,6 +319,11 @@ def build_edit_agent(llm: BaseChatModel):
             # 对话太长时，把较早的消息压缩成一段摘要，只保留最近 20 条原文
             # 不压缩的话，聊得越久，每次调用的 token 越多，越来越慢、越来越贵，最终超出模型的上下文长度
             SummarizationMiddleware(model=llm, trigger=("tokens", 6000), keep=("messages", 20)),
+            # P8：外部服务的工具偶尔会因为网络抖动失败（抛异常），自动重试 2 次，间隔 0.5 秒、1 秒
+            # 注意：工具"正常地返回了错误信息"（比如"没有搜到"）不算异常，不会重试，交给模型自己处理
+            ToolRetryMiddleware(tools=["search_more_places", "get_weather"], max_retries=2, initial_delay=0.5),
+            # P8：一轮对话里最多搜索 3 次，防止模型反复换关键词搜个没完（每次都要花钱、花时间）
+            ToolCallLimitMiddleware(tool_name="search_more_places", run_limit=3),
             # P6：调用 book_hotel 之前暂停，等用户批准或拒绝。其他工具不受影响，照常自动执行
             # 原理：模型输出工具调用之后（after_model），中间件检查有没有要审批的工具，有就 interrupt()
             HumanInTheLoopMiddleware(

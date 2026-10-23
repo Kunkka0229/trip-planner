@@ -32,8 +32,9 @@ from app.graph.state import PlannerDeps, TripState
 from app.models.schemas import WeatherInfo
 from app.planner.context import compact_for_prompt
 from app.planner.grounding import ground_plan
-from app.graph.edit_agent import build_edit_agent
+from app.graph.edit_agent import build_edit_agent, MCP_TOOL_NAMES
 from app.memory.memories import format_memories, recall
+from app.services.trip_mcp import load_trip_mcp_tools
 
 logger = logging.getLogger(__name__)  # __name__ 是模块名，例如 app.graph.trip_graph，日志里会显示出来
 
@@ -180,14 +181,21 @@ def budget_check(state: TripState, runtime: Runtime[PlannerDeps]) -> Command[Lit
 
 async def assistant(state: TripState, runtime: Runtime[PlannerDeps]) -> dict[str, Any]:
     """P5：多轮修改。把对话和行程交给修改 Agent，拿回新的对话和新的行程"""
-    agent = build_edit_agent(runtime.context.llm)
+    # P8：加载 MCP 工具（服务不可用时是空列表，Agent 照常工作）
+    agent = build_edit_agent(runtime.context.llm, await load_trip_mcp_tools(MCP_TOOL_NAMES))
     # P7：用用户最新的一句话去召回相关的长期记忆
     memories = await recall(runtime.store, state.get("user_id"), state["messages"][-1].text)
     # 在节点里调用另一张图：config（回调、checkpointer）会自动传下去，trace 里它显示为 assistant 的子节点
     result = await agent.ainvoke({key: state[key] for key in ("messages", "plan", "context", "request")} | {"memories": memories})
     # 修改 Agent 可能把较早的消息压缩成了摘要（SummarizationMiddleware），
     # 所以先清空主图里的消息，再整体换成 Agent 返回的版本，两边保持一致
-    return {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *result["messages"]], "plan": result["plan"]}
+    
+    # P8：context 也要带回来，search_more_places 可能往里面加了新的候选，下一轮对话还要用
+    return {
+        "messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *result["messages"]],
+        "plan": result["plan"],
+        "context": result["context"],
+    }
 
 # ---------- 路由函数：读 state，返回下一个节点的名字 ----------
 # 返回值类型写成 Literal：LangGraph 会据此知道"可能去哪些节点"，画图时能画出所有分支

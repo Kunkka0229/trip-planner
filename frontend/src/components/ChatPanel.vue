@@ -61,7 +61,19 @@ watch(
         <div :class="['bubble', { error: m.error }]">
           <!-- 工具执行结果：模型实际做了哪些修改 -->
           <div v-if="m.tools?.length" class="bubble-tools">
-            <a-tag v-for="(t, j) in m.tools" :key="j" color="blue" class="tool-tag">🔧 {{ t }}</a-tag>
+            <template v-for="(t, j) in m.tools" :key="j">
+              <!-- P8：搜索到的新候选，点开看名字和价格（<details> 是浏览器自带的折叠，不用写状态） -->
+              <details v-if="t.places" class="tool-places">
+                <summary>🔍 {{ t.text }}</summary>
+                <ul>
+                  <li v-for="p in t.places" :key="p.name">
+                    <span>{{ p.name }}<span class="place-district">{{ p.district }}</span></span>
+                    <span class="place-price">¥{{ p.price }}</span>
+                  </li>
+                </ul>
+              </details>
+              <a-tag v-else color="blue" class="tool-tag">🔧 {{ t.text }}</a-tag>
+            </template>
           </div>
           <span v-if="m.content">{{ m.content }}</span>
           <span v-else-if="m.pending" class="bubble-status">
@@ -186,6 +198,42 @@ watch(
 .tool-tag {
   white-space: normal; /* 工具结果可能较长，允许换行 */
   margin-inline-end: 0;
+}
+
+.tool-places {
+  width: 100%;
+  padding: 4px 8px;
+  border: 1px solid #91caff;
+  border-radius: 4px;
+  background: #e6f4ff;
+  color: #0958d9;
+  font-size: 12px;
+}
+
+.tool-places summary {
+  cursor: pointer;
+}
+
+.tool-places ul {
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.tool-places li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  line-height: 1.8;
+}
+
+.place-district {
+  margin-left: 6px;
+  color: rgba(0, 0, 0, 0.45);
+}
+
+.place-price {
+  flex-shrink: 0;
 }
 
 .bubble-status {

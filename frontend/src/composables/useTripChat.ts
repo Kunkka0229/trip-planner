@@ -6,9 +6,40 @@ import { message } from 'ant-design-vue'
 import { chatStream, getSession, httpStatus, isNothingToUndo, resumeStream, undoEdit, type TurnResult } from '@/services/api'
 import type { ChatMessage, Decision, PendingQuestion, TripPlan, TripSession } from '@/types'
 
+/** P8：search_more_places 新加入候选的地点（后端只给模型看这三个字段） */
+export interface FoundPlace {
+  name: string
+  district: string
+  price: number
+}
+
+/** 一次工具调用的结果。places 有值时显示成"🔍 搜到了 N 个新地点"，可以展开看名字和价格 */
+export interface ToolEntry {
+  text: string
+  places?: FoundPlace[]
+}
+
+/**
+ * 把工具结果整理成界面要显示的样子
+ * search_more_places 成功时 content 是"已加入候选：[{...}, ...]"，冒号后面是 JSON 列表；
+ * 失败（"搜索失败：……"、"没有搜到新的……"）或格式对不上时，按普通文字显示
+ */
+function toToolEntry(name: string, content: string): ToolEntry {
+  const PREFIX = '已加入候选：'
+  if (name === 'search_more_places' && content.startsWith(PREFIX)) {
+    try {
+      const places = JSON.parse(content.slice(PREFIX.length)) as FoundPlace[]
+      return { text: `搜到了 ${places.length} 个新地点`, places }
+    } catch {
+      // 解析失败就退回显示原文
+    }
+  }
+  return { text: content }
+}
+
 /** 界面上的一条消息：在后端 ChatMessage 的基础上，加上只在前端用的状态 */
 export interface UiMessage extends ChatMessage {
-  tools?: string[] // 这一轮调用工具的结果，显示成小标签"🔧 已把第 2 天……"
+  tools?: ToolEntry[] // 这一轮调用工具的结果，显示成小标签"🔧 已把第 2 天……"
   status?: string // P6：重新生成行程时的阶段文字，例如"正在重新生成（第 1 次）"
   pending?: boolean // 助手还在生成
   error?: boolean // 这一轮失败了
@@ -66,7 +97,7 @@ export function useTripChat(threadId: Ref<string | undefined>, onPlanChanged: (p
       const result = await request(
         {
           onToken: (t) => (bot.content += t),
-          onToolResult: (_name, text) => bot.tools!.push(text),
+          onToolResult: (name, text) => bot.tools!.push(toToolEntry(name, text)),
           onProgress: (stage) => (bot.status = stage),
         },
         controller.signal,
