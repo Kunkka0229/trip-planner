@@ -5,6 +5,7 @@ import { computed, onBeforeUnmount, ref, type Ref } from 'vue'
 import { message } from 'ant-design-vue'
 import { chatStream, getSession, httpStatus, isNothingToUndo, resumeStream, undoEdit, type TurnResult } from '@/services/api'
 import type { ChatMessage, Decision, PendingQuestion, TripPlan, TripSession } from '@/types'
+import { parseSources, type GuideSource } from '@/utils/guide'
 
 /** list_candidates / search_more_places 返回的地点（后端只给模型看名字、区、价格这几个字段） */
 export interface FoundPlace {
@@ -18,6 +19,7 @@ export interface ToolEntry {
   icon: string
   text: string
   places?: FoundPlace[]
+  guides?: GuideSource[] // P9：查到的攻略，显示成可展开的出处列表
 }
 
 /** 返回地点列表的工具：content 去掉前缀后是 JSON 列表 */
@@ -32,6 +34,11 @@ const PLACE_TOOLS: Record<string, { prefix: string; icon: string; label: (n: num
  * 失败（"搜索失败：……"、"没有搜到新的……"）或格式对不上时，按普通文字显示
  */
 function toToolEntry(name: string, content: string): ToolEntry {
+  // P9：查攻略。没查到时 guides 为空，按普通文字显示"知识库里没有找到相关内容"
+  if (name === 'search_travel_guide') {
+    const guides = parseSources(content)
+    if (guides.length) return { icon: '📚', text: `查到 ${guides.length} 条攻略`, guides }
+  }
   const spec = PLACE_TOOLS[name]
   if (spec && content.startsWith(spec.prefix)) {
     try {
@@ -50,6 +57,8 @@ export interface UiMessage extends ChatMessage {
   status?: string // P6：重新生成行程时的阶段文字，例如"正在重新生成（第 1 次）"
   pending?: boolean // 助手还在生成
   error?: boolean // 这一轮失败了
+  // P9：回复里 [1] [2] 对应的出处。只在当前页面有：刷新后后端不返回工具结果，编号按原文显示
+  sources?: GuideSource[]
 }
 
 export function useTripChat(threadId: Ref<string | undefined>, onPlanChanged: (plan: TripPlan) => void) {
@@ -104,7 +113,12 @@ export function useTripChat(threadId: Ref<string | undefined>, onPlanChanged: (p
       const result = await request(
         {
           onToken: (t) => (bot.content += t),
-          onToolResult: (name, text) => bot.tools!.push(toToolEntry(name, text)),
+          onToolResult: (name, text) => {
+            const entry = toToolEntry(name, text)
+            bot.tools!.push(entry)
+            // 一轮里查了好几次时，每次的编号都从 [1] 开始，模型引用的是最近一次的结果，以最后一次为准
+            if (entry.guides) bot.sources = entry.guides
+          },
           onProgress: (stage) => (bot.status = stage),
         },
         controller.signal,

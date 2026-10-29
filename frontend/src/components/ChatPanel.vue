@@ -2,6 +2,7 @@
 // P5：对话面板。只负责显示和输入，状态都在 useTripChat 里（由结果页创建后传进来）
 import { nextTick, ref, watch } from 'vue'
 import type { TripChat } from '@/composables/useTripChat'
+import { splitCitations } from '@/utils/guide'
 
 const props = defineProps<{ chat: TripChat }>()
 
@@ -72,10 +73,35 @@ watch(
                   </li>
                 </ul>
               </details>
+              <!-- P9：查到的攻略出处 -->
+              <details v-else-if="t.guides" class="tool-places">
+                <summary>{{ t.icon }} {{ t.text }}</summary>
+                <ul>
+                  <li v-for="g in t.guides" :key="g.n">
+                    <span>[{{ g.n }}] 《{{ g.title }}》{{ g.section }}</span>
+                    <span class="place-district">{{ g.updatedAt }}</span>
+                  </li>
+                </ul>
+              </details>
               <a-tag v-else color="blue" class="tool-tag">{{ t.icon }} {{ t.text }}</a-tag>
             </template>
           </div>
-          <span v-if="m.content">{{ m.content }}</span>
+          <span v-if="m.content">
+            <!-- P9：[1] [2] 换成上标，点击弹出出处原文；没有对应出处的编号按原文显示 -->
+            <template v-for="(seg, k) in splitCitations(m.content, m.sources)" :key="k">
+              <template v-if="seg.type === 'text'">{{ seg.text }}</template>
+              <a-popover v-else trigger="click" placement="top" :overlay-style="{ maxWidth: '320px' }">
+                <template #title>
+                  《{{ seg.source.title }}》{{ seg.source.section }}
+                  <div class="cite-date">更新于 {{ seg.source.updatedAt }}，信息可能有变化，以官方为准</div>
+                </template>
+                <template #content>
+                  <div class="cite-text">{{ seg.source.text }}</div>
+                </template>
+                <sup class="cite">[{{ seg.source.n }}]</sup>
+              </a-popover>
+            </template>
+          </span>
           <span v-else-if="m.pending" class="bubble-status">
             <a-spin size="small" />
             <!-- P6：降档重新生成时显示阶段文字 -->
@@ -234,6 +260,26 @@ watch(
 
 .place-price {
   flex-shrink: 0;
+}
+
+.cite {
+  margin: 0 1px;
+  color: #1677ff;
+  cursor: pointer;
+}
+
+.cite-date {
+  font-size: 12px;
+  font-weight: normal;
+  color: rgba(0, 0, 0, 0.45);
+}
+
+.cite-text {
+  max-height: 240px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  font-size: 13px;
+  line-height: 1.6;
 }
 
 .bubble-status {

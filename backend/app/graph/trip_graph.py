@@ -35,6 +35,7 @@ from app.planner.grounding import ground_plan
 from app.graph.edit_agent import build_edit_agent, MCP_TOOL_NAMES
 from app.memory.memories import format_memories, recall
 from app.services.trip_mcp import load_trip_mcp_tools
+from app.knowledge.checks import closure_warnings
 
 logger = logging.getLogger(__name__)  # __name__ 是模块名，例如 app.graph.trip_graph，日志里会显示出来
 
@@ -113,7 +114,7 @@ async def generate(state: TripState, runtime: Runtime[PlannerDeps]) -> dict[str,
     
     return {"attempts": attempt, "draft": "".join(parts), "memories": memories}
 
-def validate(state: TripState) -> dict[str, Any]:
+def validate(state: TripState, runtime: Runtime[PlannerDeps]) -> dict[str, Any]:
     """校验 + grounding + 天气覆盖 + 预算重算（原来 context_planner 里 postprocess 闭包做的事）"""
     request, context = state["request"], state["context"]
     try:
@@ -127,7 +128,10 @@ def validate(state: TripState) -> dict[str, Any]:
     
     logger.info("Grounding: 景点命中率 %.0f%%，未匹配 %s", stats["attraction_rate"] * 100, stats["ungrounded"])
     status = context["tool_status"]
-    warnings = [f"{name} 数据获取失败" for name, s in status.items() if not s["ok"]]
+    
+    # P9：闭馆冲突排在最前面：这是会让用户白跑一趟的问题，比其他警告都重要
+    warnings = closure_warnings(plan, runtime.context.kb, request.city)
+    warnings += [f"{name} 数据获取失败" for name, s in status.items() if not s["ok"]]
     warnings += [f"{name} 不在高德候选中" for name in dict.fromkeys(stats["ungrounded"])]
     return {"plan": plan, "source": "llm", "warnings": warnings}
 
@@ -182,7 +186,8 @@ def budget_check(state: TripState, runtime: Runtime[PlannerDeps]) -> Command[Lit
 async def assistant(state: TripState, runtime: Runtime[PlannerDeps]) -> dict[str, Any]:
     """P5：多轮修改。把对话和行程交给修改 Agent，拿回新的对话和新的行程"""
     # P8：加载 MCP 工具（服务不可用时是空列表，Agent 照常工作）
-    agent = build_edit_agent(runtime.context.llm, await load_trip_mcp_tools(MCP_TOOL_NAMES))
+    mcp_tools = await load_trip_mcp_tools(MCP_TOOL_NAMES)
+    agent = build_edit_agent(runtime.context.llm, mcp_tools, use_kb=runtime.context.kb is not None)
     # P7：用用户最新的一句话去召回相关的长期记忆
     memories = await recall(runtime.store, state.get("user_id"), state["messages"][-1].text)
     # 在节点里调用另一张图：config（回调、checkpointer）会自动传下去，trace 里它显示为 assistant 的子节点

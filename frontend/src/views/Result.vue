@@ -10,6 +10,7 @@ import { getSession, submitFeedback } from '@/services/api'
 import type { TripPlan, TripRequest, WeatherInfo } from '@/types'
 import { recomputeBudget } from '@/utils/budget'
 import { exportAsImage, exportAsPdf } from '@/utils/export'
+import { parseClosures, type ClosureWarning } from '@/utils/guide'
 
 const router = useRouter()
 const route = useRoute()
@@ -66,6 +67,32 @@ const chat = useTripChat(threadId, applyPlan)
 const screens = Grid.useBreakpoint()
 const isWide = computed(() => !!screens.value.md)
 const drawerOpen = ref(false)
+
+// ---------- P9：闭馆提醒 ----------
+// 来源：生成结果的 message，加上对话里修改工具的返回（改完行程后端也会检查闭馆）
+// 只保留"那一天现在还有这个景点"的：用户已经让助手换掉了，提醒就该消失
+const closuresByDay = computed(() => {
+  const texts = [notice.value]
+  for (const m of chat.messages.value) {
+    for (const t of m.tools ?? []) if (!t.guides) texts.push(t.text) // 攻略原文里的"闭馆"不算
+  }
+  const result = new Map<number, ClosureWarning[]>()
+  for (const w of parseClosures(texts.join('；'))) {
+    const day = plan.value?.days[w.day - 1]
+    if (!day?.attractions.some((a) => a.name === w.name)) continue
+    const list = result.get(w.day - 1) ?? []
+    if (!list.some((x) => x.name === w.name)) list.push(w) // 同一个提醒可能出现多次，去重
+    result.set(w.day - 1, list)
+  }
+  return result
+})
+
+/** 让助手调整：直接发一条对话，窄屏时顺便打开对话抽屉，让用户看到助手在做什么 */
+function askToFixClosure(dayIndex: number, list: ClosureWarning[]) {
+  const names = list.map((w) => w.name).join('、')
+  chat.send(`第 ${dayIndex + 1} 天的 ${names} 闭馆，帮我换到别的日期`)
+  if (!isWide.value) drawerOpen.value = true
+}
 
 // 进入页面、或者从一个会话跳到另一个会话时加载数据
 // 有 thread_id：从后端恢复行程和对话（刷新、换设备打开都能用，前提是同一个 X-User-Id）
@@ -336,6 +363,22 @@ function openDislike() {
           :title="`第 ${day.day_index + 1} 天 · ${day.date}`"
           :class="['section', { flash: highlightDays.has(dayIndex) }]"
         >
+          <!-- P9：闭馆冲突 -->
+          <div v-if="closuresByDay.get(dayIndex)" class="closure">
+            <a-tag v-for="w in closuresByDay.get(dayIndex)" :key="w.name" color="red">
+              ⚠️ {{ w.name }} {{ w.when.split(' ').pop() }}闭馆
+            </a-tag>
+            <a-button
+              v-if="threadId"
+              size="small"
+              type="link"
+              :disabled="chat.sending.value || chat.blocked.value"
+              data-export-ignore
+              @click="askToFixClosure(dayIndex, closuresByDay.get(dayIndex)!)"
+            >
+              让助手帮我调整
+            </a-button>
+          </div>
           <p>{{ day.description }}</p>
           <p v-if="day.hotel">🏨 {{ day.hotel.name }}（{{ day.hotel.estimated_cost }} 元/间/晚）</p>
 
@@ -433,6 +476,14 @@ function openDislike() {
 .section {
   margin-bottom: 16px;
   scroll-margin-top: 16px; /* 锚点跳转时顶部留出一点空间 */
+}
+
+.closure {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 12px;
 }
 
 .weather-text {

@@ -11,6 +11,7 @@ from langgraph.graph.message import add_messages
 from app.models.schemas import TripPlan, TripRequest
 from app.services.amap_client import AmapClient
 from app.services.booking import BookingService, get_booking_service
+from app.knowledge.base import KnowledgeBase
 
 class TripState(TypedDict, total=False):
     request: TripRequest  # 输入：用户的旅行需求
@@ -46,5 +47,7 @@ class PlannerDeps:
     booking: BookingService = field(default_factory=get_booking_service)
     # P6：有没有人在线回答问题。评测、批处理时设成 False，遇到需要确认的情况按默认方式处理，不中断
     interactive: bool = True
+    # P9：攻略知识库。没有配置 embedding 模型时是 None，相关功能自动关闭
+    kb: KnowledgeBase | None = None
     
 

@@ -86,6 +86,9 @@ class Settings(BaseSettings):
     mcp_port: int = 7002  # MCP Server 监听的端口
     mcp_token: str = ""  # 调用 MCP Server 需要的令牌；留空 = 不鉴权（只能在本机开发时这样做）
     trip_mcp_url: str = ""  # 主服务连接 MCP Server 的地址，例如 http://127.0.0.1:7002/mcp；留空 = 不使用
+
+    # ---------- 攻略知识库（P9）----------
+    kb_dir: str = "data/chroma"  # Chroma 数据目录，相对于 backend/；需要先配置 EMBEDDING_MODEL
     
     # @property：把方法变成"只读属性"，调用时不用加括号：settings.cors_origins_list
     # 类似 JS class 里的 get corsOriginsList() { ... }

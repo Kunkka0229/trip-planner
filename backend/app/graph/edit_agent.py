@@ -10,6 +10,7 @@
 """
 
 import json
+import asyncio
 from typing import Any, Callable, Literal, NotRequired
 
 from langchain.agents import AgentState, create_agent
@@ -29,6 +30,8 @@ from app.agents.output import PlanValidationError, recompute_budget, validate_pl
 from app.models.schemas import Attraction, Location, Meal, TripPlan, TripRequest
 from app.planner.grounding import find_candidate
 from app.services.trip_mcp import TripMCPError, call_trip_tool
+from app.knowledge.base import format_hits
+from app.knowledge.checks import closure_warnings
 
 class TripChatState(AgentState):
     """在 create_agent 自带的 state（messages）上，加上行程相关的字段，工具通过 runtime.state 读取"""
@@ -77,6 +80,10 @@ def apply_edit(runtime: Runtime, summary: str, mutate: Callable[[TripPlan], None
         return f"修改失败：{exc}"  # 返回字符串 = 普通的工具结果，模型看到后会调整做法
     
     plan.budget = recompute_budget(plan, request)
+    # P9：改完之后检查闭馆冲突。不阻止修改，但把问题告诉模型，让它自己决定要不要调整
+    if conflicts := closure_warnings(plan, runtime.context.kb, request.city):
+        summary += "。注意：" + "；".join(conflicts)
+        
     # 返回 Command：工具不只是"返回一段文字"，还可以直接更新 state
     # 注意 messages 里必须有一条对应这次调用的 ToolMessage，否则模型会以为工具没有返回
     return Command(
@@ -241,6 +248,15 @@ async def search_more_places(kind: Literal["attraction", "hotel", "food"], keywo
         "context": context,
         "messages": [ToolMessage(f"已加入候选：{json.dumps(added, ensure_ascii=False)}", tool_call_id=runtime.tool_call_id)],
     })
+    
+@tool
+async def search_travel_guide(query: str, runtime: Runtime) -> str:
+    """查询旅行攻略知识库：开放时间、闭馆日、预约方式、门票、游览路线、避坑提醒、带娃带老人的建议等。
+    回答这类问题之前必须先查；回答时用 [1] [2] 标注引用了哪一条，知识库里没有的内容不要编造。"""
+    kb = runtime.context.kb
+    # Chroma 的 Python 客户端是同步的，放到线程里执行，不卡住事件循环（P4 讲过）
+    hits = await asyncio.to_thread(kb.search, query, runtime.state["request"].city, 4)
+    return format_hits(hits)
 
 def describe_booking(tool_call: ToolCall, state: dict, runtime) -> str:
     """审批弹窗里给用户看的说明：用人话把"要花多少钱、订什么"讲清楚，而不是丢给用户一串 JSON"""
@@ -263,6 +279,9 @@ EDIT_SYSTEM_PROMPT = """你是旅行行程的修改助手。用户已经有一�
 6. 用户只是提问（比如"第二天去哪"）时，直接根据当前行程回答，不要调用修改工具。
 7. 用户要求预订酒店时，按行程里的酒店和日期调用 book_hotel；房间数按同行人数计算（2 人一间）。用户拒绝预订时，不要再次尝试。
 8. 候选里没有用户想要的地点时，先用 search_more_places 搜索（如果有这个工具），再从搜到的结果里选。
+9. 用户问开放时间、预约、门票、注意事项这类问题时，先用 search_travel_guide 查（如果有这个工具），
+   回答里用 [1] [2] 标注出处；查不到就如实说不确定，建议用户以官方信息为准。
+10. 工具结果里出现"闭馆"提醒时，主动告诉用户，并建议把这个景点换到别的日期。
 
 当前行程（day 从 1 开始）：
 {plan}
@@ -301,13 +320,19 @@ def edit_prompt(request: ModelRequest) -> str:
 # P8：依赖 trip-data MCP 服务的工具。服务不可用时整组去掉，Agent 照常工作，只是不能搜索新地点
 MCP_TOOL_NAMES = {"get_weather"}  # 直接交给模型使用的 MCP 工具
 
-def build_edit_agent(llm: BaseChatModel, mcp_tools: list[BaseTool] | None = None):
+def build_edit_agent(llm: BaseChatModel, mcp_tools: list[BaseTool] | None = None, use_kb: bool = False):
     """每次调用时用运行时传入的 llm 创建（create_agent 只是把节点连成图，耗时可以忽略）
 
     mcp_tools（P8）：从 trip-data MCP 服务加载的工具；传了说明服务可用，同时启用 search_more_places
     """
     
+    """...
+    use_kb（P9）：知识库可用时，加上 search_travel_guide
+    """
+    
     extra = [search_more_places, *mcp_tools] if mcp_tools else []
+    if use_kb:
+        extra.append(search_travel_guide)
     return create_agent(
         llm,
         tools=[*EDIT_TOOLS, *extra],

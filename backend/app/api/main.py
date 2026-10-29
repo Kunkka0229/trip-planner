@@ -20,6 +20,7 @@ from app.graph.trip_graph import build_trip_graph
 from app.memory.memories import MemoryWriter
 from app.memory.store import open_store
 from app.services.llm_service import LLMNotConfiguredError, get_llm
+from app.knowledge.service import get_knowledge_base
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,7 @@ async def lifespan(app: FastAPI):
         open_store(settings.store_url) as store,
     ):
         app.state.store = store
+        app.state.kb = get_knowledge_base()  # P9：没有配置 embedding 时是 None
         app.state.memory_writer = MemoryWriter(llm=memory_llm())
         app.state.trip_graph = build_trip_graph(checkpointer=checkpointer, store=store)
         yield  # ← 服务在这里运行，直到收到关闭信号
