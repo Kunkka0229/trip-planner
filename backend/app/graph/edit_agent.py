@@ -265,7 +265,11 @@ def describe_booking(tool_call: ToolCall, state: dict, runtime) -> str:
     price = row["estimated_cost_hint"] * args.get("nights", 0) * args.get("rooms", 0) if row else "未知"
     return f"即将预订 {args.get('hotel_name')}：{args.get('check_in')} 入住 {args.get('nights')} 晚，{args.get('rooms')} 间，预计 {price} 元"
 
-EDIT_TOOLS = [list_candidates, replace_attraction, remove_attraction, add_attraction, replace_meal, update_day_description]
+
+# ---------- 工具分组（P10）：单 Agent 用全部工具；多 Agent 时，每个专家只拿自己那一组 ----------
+MODIFY_TOOLS = [list_candidates, replace_attraction, remove_attraction, add_attraction, replace_meal, update_day_description]
+EDIT_TOOLS = [*MODIFY_TOOLS, book_hotel]
+
 
 # ---------- 动态系统提示词：每次调用模型前，把"当前的行程"写进去 ----------
 EDIT_SYSTEM_PROMPT = """你是旅行行程的修改助手。用户已经有一份行程，你根据用户的要求，用工具做**最小的修改**。
@@ -282,6 +286,9 @@ EDIT_SYSTEM_PROMPT = """你是旅行行程的修改助手。用户已经有一�
 9. 用户问开放时间、预约、门票、注意事项这类问题时，先用 search_travel_guide 查（如果有这个工具），
    回答里用 [1] [2] 标注出处；查不到就如实说不确定，建议用户以官方信息为准。
 10. 工具结果里出现"闭馆"提醒时，主动告诉用户，并建议把这个景点换到别的日期。
+11. 用户问高铁、火车时，用 12306 的工具查（如果有这些工具）：相对日期先用 get-current-date 换算；
+    先用 get-station-code-of-citys 查车站代码，再用 get-tickets 查询，高铁用 trainFilterFlags="G"，limitedNum 最多 10。
+    用户没说从哪里出发时，先问用户，不要猜。12306 只能查大约 15 天内的票。
 
 当前行程（day 从 1 开始）：
 {plan}
@@ -320,7 +327,12 @@ def edit_prompt(request: ModelRequest) -> str:
 # P8：依赖 trip-data MCP 服务的工具。服务不可用时整组去掉，Agent 照常工作，只是不能搜索新地点
 MCP_TOOL_NAMES = {"get_weather"}  # 直接交给模型使用的 MCP 工具
 
-def build_edit_agent(llm: BaseChatModel, mcp_tools: list[BaseTool] | None = None, use_kb: bool = False):
+def build_edit_agent(
+    llm: BaseChatModel, 
+    mcp_tools: list[BaseTool] | None = None, 
+    use_kb: bool = False,
+    rail_tools: list[BaseTool] | None = None
+):
     """每次调用时用运行时传入的 llm 创建（create_agent 只是把节点连成图，耗时可以忽略）
 
     mcp_tools（P8）：从 trip-data MCP 服务加载的工具；传了说明服务可用，同时启用 search_more_places
@@ -330,9 +342,14 @@ def build_edit_agent(llm: BaseChatModel, mcp_tools: list[BaseTool] | None = None
     use_kb（P9）：知识库可用时，加上 search_travel_guide
     """
     
+    """...
+    rail_tools（P10）：从 12306 MCP 加载的工具；服务不可用时为空，Agent 就不能查火车
+    """
+    
     extra = [search_more_places, *mcp_tools] if mcp_tools else []
     if use_kb:
         extra.append(search_travel_guide)
+    extra += rail_tools or []
     return create_agent(
         llm,
         tools=[*EDIT_TOOLS, *extra],

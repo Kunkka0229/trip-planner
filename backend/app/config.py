@@ -89,6 +89,13 @@ class Settings(BaseSettings):
 
     # ---------- 攻略知识库（P9）----------
     kb_dir: str = "data/chroma"  # Chroma 数据目录，相对于 backend/；需要先配置 EMBEDDING_MODEL
+
+    # ---------- 12306 MCP（P10）----------
+    rail_mcp_url: str = ""  # 12306 MCP 服务的地址（魔搭托管或本机运行）；留空 = 不提供火车查询
+
+    # ---------- 多 Agent（P10）----------
+    # single = 一个修改助手拿着全部工具（P5~P9）；supervisor = 主管 + 三个专家
+    assistant_mode: Literal["single", "supervisor"] = "single"
     
     # @property：把方法变成"只读属性"，调用时不用加括号：settings.cors_origins_list
     # 类似 JS class 里的 get corsOriginsList() { ... }

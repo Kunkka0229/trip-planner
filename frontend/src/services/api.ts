@@ -273,7 +273,7 @@ export function isNothingToUndo(error: unknown): boolean {
 
 type TurnEvent =
   | { type: 'token'; text: string }
-  | { type: 'tool_result'; name: string; content: string }
+  | { type: 'tool_result'; name: string; content: string; agent?: string | null } // P10：agent = 哪个 Agent 调用的工具
   | { type: 'progress'; stage: string; percent: number } // P6：降档后重新生成行程，会推送和首页一样的进度
   | { type: 'interrupt' } & PendingQuestion // P6：又有新问题要确认（最终以 done 里的 pending 为准）
   | { type: 'done'; reply: string; plan: TripPlan | null; pending: PendingQuestion[] }
@@ -281,7 +281,8 @@ type TurnEvent =
 
 export interface TurnHandlers {
   onToken?: (text: string) => void // 助手回复的一小段文字，逐段追加到气泡里（打字机效果）
-  onToolResult?: (name: string, content: string) => void // 工具执行结果，例如"已把第 2 天的……"
+  // 工具执行结果，例如"已把第 2 天的……"；P10：agent 是调用工具的 Agent（create_agent 的 name）
+  onToolResult?: (name: string, content: string, agent?: string | null) => void
   onProgress?: (stage: string) => void // 重新生成行程时的阶段文字
 }
 
@@ -301,7 +302,7 @@ async function streamTurn(path: string, body: unknown, handlers: TurnHandlers, s
         handlers.onToken?.(event.text)
         break
       case 'tool_result':
-        handlers.onToolResult?.(event.name, event.content)
+        handlers.onToolResult?.(event.name, event.content, event.agent)
         break
       case 'progress':
         handlers.onProgress?.(event.stage)

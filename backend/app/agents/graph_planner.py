@@ -16,6 +16,9 @@ from app.observability.tracing import langchain_callbacks
 # 取代第 11 课的 ProgressFn(stage, percent)：事件不止"进度"一种了，统一用字典表示，靠 type 区分
 EmitFn = Callable[[dict[str, Any]], None]
 
+# P10：直接和用户对话的 Agent（create_agent 的 name）。专家们的输出是给主管看的，不推给用户
+USER_FACING_AGENTS = {"trip_editor", "trip_assistant"}
+
 def no_emit(event: dict[str, Any]) -> None:
     """默认回调：什么都不做（和第 11 课的 no_progress 一样）"""
 
@@ -71,10 +74,14 @@ async def drive(
             emit(chunk)
         elif mode == "messages":
             message, metadata = chunk
+            agent = metadata.get("lc_agent_name")  # 这条消息来自哪个 Agent（create_agent 的 name）
             if isinstance(message, ToolMessage):
-                emit({"type": "tool_result", "name": message.name, "content": message.text})
+                # P10：带上 agent，前端可以把专家内部的步骤折叠显示
+                emit({"type": "tool_result", "name": message.name, "content": message.text, "agent": agent})
             # 只推修改 Agent 的 model 节点的文字。generate 节点输出的是 JSON，P4 已经用逐天草稿的方式推送了
-            elif isinstance(message, AIMessageChunk) and message.text and metadata.get("langgraph_node") == "model":
+            # 只推"直接和用户对话的 Agent"在 model 节点生成的文字：
+            #   generate 节点输出的是 JSON（P4 用逐天草稿推送）；专家的输出是给主管看的；摘要中间件的输出是内部的
+            elif (isinstance(message, AIMessageChunk) and message.text and metadata.get("langgraph_node") == "model" and agent in USER_FACING_AGENTS):
                 emit({"type": "token", "text": message.text})
         elif namespace == ():
             final = chunk

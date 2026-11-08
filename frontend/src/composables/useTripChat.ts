@@ -20,6 +20,34 @@ export interface ToolEntry {
   text: string
   places?: FoundPlace[]
   guides?: GuideSource[] // P9：查到的攻略，显示成可展开的出处列表
+  detail?: string // P10：原始结果太长（例如 12306 的余票列表）时折叠起来，标题只显示一句说明
+  // P10：委派步骤（多 Agent 版）。expert 有值时，这一条代表"主管把任务交给了某个专家"，
+  // steps 是专家内部的工具结果；done 之前标题显示"处理中"，主管拿到结论后换成专家的结论
+  expert?: string
+  label?: string
+  steps?: ToolEntry[]
+  done?: boolean
+}
+
+/** P10：直接和用户对话的 Agent（和后端 USER_FACING_AGENTS 一致）。其他 Agent 都是专家 */
+const USER_FACING_AGENTS = new Set(['trip_assistant', 'trip_editor'])
+
+/** P10：专家（create_agent 的 name）→ 显示名称、主管委派给它用的工具 */
+const EXPERTS: Record<string, { label: string; tool: string }> = {
+  editor_expert: { label: '编辑专家', tool: 'delegate_edit' },
+  guide_expert: { label: '攻略专家', tool: 'ask_guide' },
+  transport_expert: { label: '交通专家', tool: 'ask_transport' },
+}
+const EXPERT_BY_TOOL = Object.fromEntries(Object.entries(EXPERTS).map(([agent, e]) => [e.tool, agent]))
+
+/** P10：12306 MCP 的工具，返回的是很长的原始文本，标题换成一句说明 */
+const RAIL_TOOLS: Record<string, string> = {
+  'get-current-date': '查询今天的日期',
+  'get-station-code-of-citys': '查询车站代码',
+  'get-stations-code-in-city': '查询城市的车站',
+  'get-tickets': '查询余票',
+  'get-interline-tickets': '查询中转方案',
+  'get-train-route-stations': '查询经停站',
 }
 
 /** 返回地点列表的工具：content 去掉前缀后是 JSON 列表 */
@@ -48,7 +76,47 @@ function toToolEntry(name: string, content: string): ToolEntry {
       // 解析失败就退回显示原文
     }
   }
+  if (name in RAIL_TOOLS) return { icon: '🚄', text: RAIL_TOOLS[name], detail: content }
+  // 其他太长的结果（例如天气 JSON）也折叠起来，标题显示工具名
+  if (content.length > 120) return { icon: '🔧', text: name, detail: content }
   return { icon: '🔧', text: content }
+}
+
+/**
+ * P10：把一条工具结果放进这一轮的工具列表，返回整理好的 entry（用来取攻略出处）
+ *
+ * 事件的先后顺序：专家内部的工具结果先到，主管的委派工具（delegate_edit 等）的结果最后到，
+ * 因为委派工具要等专家干完活才返回。所以：
+ *   - 专家的结果 → 放进这个专家"进行中"的委派步骤（没有就新建一个）
+ *   - 委派工具的结果 → 把这个步骤标记为完成，标题换成专家的结论（专家没调用工具时，新建一个空步骤）
+ *   - 其他（单 Agent 版、主管自己调用的 book_hotel）→ 和以前一样，单独一条
+ */
+function addToolResult(tools: ToolEntry[], name: string, content: string, agent?: string | null): ToolEntry {
+  const entry = toToolEntry(name, content)
+  const isExpert = !!agent && !USER_FACING_AGENTS.has(agent)
+  const expert = isExpert ? agent : EXPERT_BY_TOOL[name]
+  if (!expert) {
+    tools.push(entry)
+    return entry
+  }
+  const group = openGroup(tools, expert)
+  if (isExpert) {
+    group.steps!.push(entry)
+  } else {
+    group.text = `${group.label}：${content}`
+    group.done = true
+  }
+  return entry
+}
+
+/** 取这个专家进行中的委派步骤；最后一条不是它（或者已经完成）时新建一个 */
+function openGroup(tools: ToolEntry[], expert: string): ToolEntry {
+  const last = tools[tools.length - 1]
+  if (last?.expert === expert && !last.done) return last
+  const label = EXPERTS[expert]?.label ?? expert
+  tools.push({ icon: '🧑‍💼', text: `${label}处理中…`, expert, label, steps: [] })
+  // 从数组里取出来的才是响应式代理，之后改它的 text、done，界面才会更新
+  return tools[tools.length - 1]
 }
 
 /** 界面上的一条消息：在后端 ChatMessage 的基础上，加上只在前端用的状态 */
@@ -113,9 +181,8 @@ export function useTripChat(threadId: Ref<string | undefined>, onPlanChanged: (p
       const result = await request(
         {
           onToken: (t) => (bot.content += t),
-          onToolResult: (name, text) => {
-            const entry = toToolEntry(name, text)
-            bot.tools!.push(entry)
+          onToolResult: (name, text, agent) => {
+            const entry = addToolResult(bot.tools!, name, text, agent)
             // 一轮里查了好几次时，每次的编号都从 [1] 开始，模型引用的是最近一次的结果，以最后一次为准
             if (entry.guides) bot.sources = entry.guides
           },
@@ -144,6 +211,13 @@ export function useTripChat(threadId: Ref<string | undefined>, onPlanChanged: (p
         message.error(err.message)
       }
     } finally {
+      // P10：中途停止或出错时，还在"处理中"的委派步骤改成"未完成"，不要一直转着
+      for (const t of bot.tools ?? []) {
+        if (t.expert && !t.done) {
+          t.text = `${t.label}未完成`
+          t.done = true
+        }
+      }
       bot.status = undefined
       bot.pending = false
       sending.value = false

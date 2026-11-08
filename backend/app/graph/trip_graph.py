@@ -36,6 +36,9 @@ from app.graph.edit_agent import build_edit_agent, MCP_TOOL_NAMES
 from app.memory.memories import format_memories, recall
 from app.services.trip_mcp import load_trip_mcp_tools
 from app.knowledge.checks import closure_warnings
+from app.config import get_settings
+from app.services.rail_mcp import load_rail_tools
+from app.services.supervisor import build_supervisor
 
 logger = logging.getLogger(__name__)  # __name__ 是模块名，例如 app.graph.trip_graph，日志里会显示出来
 
@@ -185,9 +188,20 @@ def budget_check(state: TripState, runtime: Runtime[PlannerDeps]) -> Command[Lit
 
 async def assistant(state: TripState, runtime: Runtime[PlannerDeps]) -> dict[str, Any]:
     """P5：多轮修改。把对话和行程交给修改 Agent，拿回新的对话和新的行程"""
-    # P8：加载 MCP 工具（服务不可用时是空列表，Agent 照常工作）
-    mcp_tools = await load_trip_mcp_tools(MCP_TOOL_NAMES)
-    agent = build_edit_agent(runtime.context.llm, mcp_tools, use_kb=runtime.context.kb is not None)
+    
+
+    if get_settings().assistant_mode == "supervisor": # P10：多 Agent 版（交通专家自己加载 12306 工具）
+        agent = build_supervisor(runtime.context.llm)
+    else:
+        # P8：加载 MCP 工具（服务不可用时是空列表，Agent 照常工作）
+        mcp_tools = await load_trip_mcp_tools(MCP_TOOL_NAMES)
+        agent = build_edit_agent(
+            runtime.context.llm, 
+            mcp_tools, 
+            use_kb=runtime.context.kb is not None,
+            rail_tools=await load_rail_tools()
+        )
+
     # P7：用用户最新的一句话去召回相关的长期记忆
     memories = await recall(runtime.store, state.get("user_id"), state["messages"][-1].text)
     # 在节点里调用另一张图：config（回调、checkpointer）会自动传下去，trace 里它显示为 assistant 的子节点

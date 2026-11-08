@@ -3,6 +3,7 @@
 import { nextTick, ref, watch } from 'vue'
 import type { TripChat } from '@/composables/useTripChat'
 import { splitCitations } from '@/utils/guide'
+import ToolEntryItem from './ToolEntryItem.vue'
 
 const props = defineProps<{ chat: TripChat }>()
 
@@ -62,29 +63,8 @@ watch(
         <div :class="['bubble', { error: m.error }]">
           <!-- 工具执行结果：模型实际做了哪些修改 -->
           <div v-if="m.tools?.length" class="bubble-tools">
-            <template v-for="(t, j) in m.tools" :key="j">
-              <!-- 查看的候选、P8 搜索到的新候选：点开看名字和价格（<details> 是浏览器自带的折叠，不用写状态） -->
-              <details v-if="t.places" class="tool-places">
-                <summary>{{ t.icon }} {{ t.text }}</summary>
-                <ul>
-                  <li v-for="p in t.places" :key="p.name">
-                    <span>{{ p.name }}<span class="place-district">{{ p.district }}</span></span>
-                    <span v-if="p.price != null" class="place-price">¥{{ p.price }}</span>
-                  </li>
-                </ul>
-              </details>
-              <!-- P9：查到的攻略出处 -->
-              <details v-else-if="t.guides" class="tool-places">
-                <summary>{{ t.icon }} {{ t.text }}</summary>
-                <ul>
-                  <li v-for="g in t.guides" :key="g.n">
-                    <span>[{{ g.n }}] 《{{ g.title }}》{{ g.section }}</span>
-                    <span class="place-district">{{ g.updatedAt }}</span>
-                  </li>
-                </ul>
-              </details>
-              <a-tag v-else color="blue" class="tool-tag">{{ t.icon }} {{ t.text }}</a-tag>
-            </template>
+            <!-- P10：显示逻辑抽到了 ToolEntryItem，委派步骤里的专家内部结果也用它 -->
+            <ToolEntryItem v-for="(t, j) in m.tools" :key="j" :entry="t" />
           </div>
           <span v-if="m.content">
             <!-- P9：[1] [2] 换成上标，点击弹出出处原文；没有对应出处的编号按原文显示 -->
@@ -219,47 +199,6 @@ watch(
   align-items: flex-start;
   gap: 4px;
   margin-bottom: 6px;
-}
-
-.tool-tag {
-  white-space: normal; /* 工具结果可能较长，允许换行 */
-  margin-inline-end: 0;
-}
-
-.tool-places {
-  width: 100%;
-  padding: 4px 8px;
-  border: 1px solid #91caff;
-  border-radius: 4px;
-  background: #e6f4ff;
-  color: #0958d9;
-  font-size: 12px;
-}
-
-.tool-places summary {
-  cursor: pointer;
-}
-
-.tool-places ul {
-  margin: 4px 0 0;
-  padding: 0;
-  list-style: none;
-}
-
-.tool-places li {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  line-height: 1.8;
-}
-
-.place-district {
-  margin-left: 6px;
-  color: rgba(0, 0, 0, 0.45);
-}
-
-.place-price {
-  flex-shrink: 0;
 }
 
 .cite {
